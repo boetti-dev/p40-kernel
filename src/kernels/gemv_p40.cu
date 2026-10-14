@@ -41,7 +41,7 @@ gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
     float acc = 0.0f;
     for (int b = lane; b < nblocks; b += 32) {
         const block_pq2_0 * wb = wrow + b;
-        const block_q8_1  * ab = X + b * QI_PQ2_0;
+        const block_q8_1  * ab = X + (size_t)b * QI_PQ2_0;
         const float dw = f16_to_f32(wb->d);
 
 #pragma unroll
@@ -52,18 +52,21 @@ gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
             const uint32_t w0 = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
             const uint32_t w1 = (uint32_t)qp[2] | ((uint32_t)qp[3] << 16);
 
-            const int4 a0 = *(const int4 *)(ab[iqs].qs + 0);
-            const int4 a1 = *(const int4 *)(ab[iqs].qs + 16);
+            // The Q8_1 block is 36 bytes, so `qs` is only 4-byte aligned: load
+            // the 32 activations as eight int32, never as an int4.
+            const int * ap = (const int *)ab[iqs].qs;
+            const int a00 = ap[0], a01 = ap[1], a02 = ap[2], a03 = ap[3];
+            const int a10 = ap[4], a11 = ap[5], a12 = ap[6], a13 = ap[7];
 
             int sumi = 0;
-            sumi = dp4a((int)((w0 >> 0) & 0x03030303u), a0.x, sumi);
-            sumi = dp4a((int)((w0 >> 2) & 0x03030303u), a0.y, sumi);
-            sumi = dp4a((int)((w0 >> 4) & 0x03030303u), a0.z, sumi);
-            sumi = dp4a((int)((w0 >> 6) & 0x03030303u), a0.w, sumi);
-            sumi = dp4a((int)((w1 >> 0) & 0x03030303u), a1.x, sumi);
-            sumi = dp4a((int)((w1 >> 2) & 0x03030303u), a1.y, sumi);
-            sumi = dp4a((int)((w1 >> 4) & 0x03030303u), a1.z, sumi);
-            sumi = dp4a((int)((w1 >> 6) & 0x03030303u), a1.w, sumi);
+            sumi = dp4a((int)((w0 >> 0) & 0x03030303u), a00, sumi);
+            sumi = dp4a((int)((w0 >> 2) & 0x03030303u), a01, sumi);
+            sumi = dp4a((int)((w0 >> 4) & 0x03030303u), a02, sumi);
+            sumi = dp4a((int)((w0 >> 6) & 0x03030303u), a03, sumi);
+            sumi = dp4a((int)((w1 >> 0) & 0x03030303u), a10, sumi);
+            sumi = dp4a((int)((w1 >> 2) & 0x03030303u), a11, sumi);
+            sumi = dp4a((int)((w1 >> 4) & 0x03030303u), a12, sumi);
+            sumi = dp4a((int)((w1 >> 6) & 0x03030303u), a13, sumi);
 
             // value = code - 1  ->  subtract the activation sum once per chunk.
             sumi -= q8_1_sum(&ab[iqs]);

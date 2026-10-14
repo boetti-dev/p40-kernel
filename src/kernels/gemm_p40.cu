@@ -26,12 +26,13 @@ constexpr int GEMM_BM      = 32;   // rows per warp
 constexpr int GEMM_BN      = 16;   // token columns per block
 constexpr int GEMM_ROWS    = GEMM_WARPS * GEMM_BM;   // 256 rows per block
 
-__global__ void gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
+__global__ void __launch_bounds__(GEMM_WARPS * 32, 2)
+gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
                                       const block_q8_1  * __restrict__ X,
                                       float * __restrict__ Y,
                                       const int n_out, const int n_tok,
                                       const int nblocks) {
-    __shared__ int8_t  X_s[QI_PQ2_0 * GEMM_BN * 32];
+    __shared__ __align__(16) int8_t X_s[QI_PQ2_0 * GEMM_BN * 32];
     __shared__ float   D_s[QI_PQ2_0 * GEMM_BN];
     __shared__ int     S_s[QI_PQ2_0 * GEMM_BN];
 
@@ -47,7 +48,7 @@ __global__ void gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
     for (int j = 0; j < GEMM_BN; ++j) acc[j] = 0.0f;
 
     const bool row_ok = row < n_out;
-    const block_pq2_0 * wrow = W + (size_t)row * (size_t)nblocks;
+    const block_pq2_0 * wrow = W + (size_t)(row_ok ? row : 0) * (size_t)nblocks;
 
     for (int b = 0; b < nblocks; ++b) {
         // ---- stage the activation slab for k-block b --------------------
@@ -57,15 +58,17 @@ __global__ void gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
             const int j   = i % GEMM_BN;
             if (j < ncol) {
                 const block_q8_1 * src = X + (size_t)(b * QI_PQ2_0 + iqs) * n_tok + (col0 + j);
-                int4 * dst = (int4 *)(X_s + i * 32);
-                dst[0] = ((const int4 *)src->qs)[0];
-                dst[1] = ((const int4 *)src->qs)[1];
+                // 32 bytes: copy as eight int32 (`qs` is only 4-byte aligned).
+                const uint32_t * sp = (const uint32_t *)src->qs;
+                uint32_t * dp = (uint32_t *)(X_s + i * 32);
+#pragma unroll
+                for (int t = 0; t < 8; ++t) dp[t] = sp[t];
                 D_s[i] = f16_to_f32(src->d);
                 S_s[i] = q8_1_sum(src);
             } else {
-                int4 * dst = (int4 *)(X_s + i * 32);
-                dst[0] = make_int4(0, 0, 0, 0);
-                dst[1] = make_int4(0, 0, 0, 0);
+                uint32_t * dp = (uint32_t *)(X_s + i * 32);
+#pragma unroll
+                for (int t = 0; t < 8; ++t) dp[t] = 0u;
                 D_s[i] = 0.0f;
                 S_s[i] = 0;
             }
