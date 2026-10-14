@@ -120,13 +120,13 @@ inline float pq2_0_dot_f32(const block_pq2_0 * w, const float * a) {
 }
 
 // ---------------------------------------------------------------------------
-// Integer DP4A dot of one PQ2_0 block against one permuted Q8_1 block
-// (128 activations = 4 chunks of 32).  Matches the P40 kernel exactly.
-// ---------------------------------------------------------------------------
-BONSAI_HD inline float pq2_0_dot_q8_1_perm(const block_pq2_0 * w,
-                                           const block_q8_1 * agroup,
-                                           int iqs) {
-    const block_q8_1 * a = agroup + iqs;      // this chunk's activation block
+// Integer DP4A dot of one PQ2_0 block against the single Q8_1 activation block
+// that covers chunk `iqs` (32 activations).  This is the exact inner body of
+// both device kernels: the GEMV passes agroup[iqs], the GEMM passes the staged
+// shared-memory block directly.
+BONSAI_HD inline float pq2_0_dot_q8_1_block(const block_pq2_0 * w,
+                                            const block_q8_1 * a,
+                                            int iqs) {
     const uint8_t * qs = w->qs + iqs * 8;     // 8 code bytes = 32 elements
     const int8_t  * as = a->qs;               // 32 activations
     int sumi = 0;
@@ -147,6 +147,14 @@ BONSAI_HD inline float pq2_0_dot_q8_1_perm(const block_pq2_0 * w,
     sumi -= q8_1_sum(a);
     const float d = f16_to_f32(w->d) * f16_to_f32(a->d);
     return d * (float)sumi;
+}
+
+// Group form: `agroup` points at the four contiguous activation blocks of one
+// weight block (the GEMV layout, one token).
+BONSAI_HD inline float pq2_0_dot_q8_1_perm(const block_pq2_0 * w,
+                                           const block_q8_1 * agroup,
+                                           int iqs) {
+    return pq2_0_dot_q8_1_block(w, agroup + iqs, iqs);
 }
 
 // Whole-row dot: `n` must be a multiple of QK_PQ2_0.

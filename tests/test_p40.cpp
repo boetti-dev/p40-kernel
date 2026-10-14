@@ -328,6 +328,138 @@ static void test_geometry() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 7. Simulate the GEMV kernel's warp-strided loop (index arithmetic copied
+//    verbatim from gemv_pq2_0_p40_kernel) and require the full row dot.
+// ---------------------------------------------------------------------------
+static void test_gemv_loop() {
+    std::printf("[gemv] warp-strided loop\n");
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+
+    const int n_in = 5120, n_out = 4;
+    const int nblocks = n_in / QK_PQ2_0;
+    std::vector<float> w((size_t)n_out * n_in), x(n_in);
+    for (auto & v : w) v = std::round(ud(rng) * 1.2f);
+    for (auto & v : x) v = ud(rng) * 3.0f;
+
+    std::vector<block_pq2_0> wq((size_t)n_out * nblocks);
+    for (int r = 0; r < n_out; ++r)
+        quantize_row_pq2_0(w.data() + (size_t)r * n_in, wq.data() + (size_t)r * nblocks, n_in);
+    std::vector<block_q8_1> xq(n_in / QK8_1);
+    quantize_row_q8_1(x.data(), xq.data(), n_in, true);
+
+    for (int row = 0; row < n_out; ++row) {
+        const block_pq2_0 * wrow = wq.data() + (size_t)row * nblocks;
+
+        // exactly the kernel's per-lane loop
+        float lane_acc[32];
+        for (int lane = 0; lane < 32; ++lane) {
+            float acc = 0.0f;
+            for (int b = lane; b < nblocks; b += 32) {
+                const block_pq2_0 * wb = wrow + b;
+                const block_q8_1  * ab = xq.data() + b * QI_PQ2_0;
+                for (int iqs = 0; iqs < QI_PQ2_0; ++iqs)
+                    acc += pq2_0_dot_q8_1_perm(wb, ab, iqs);
+            }
+            lane_acc[lane] = acc;
+        }
+        float total = 0.0f;
+        for (int l = 0; l < 32; ++l) total += lane_acc[l];
+
+        float ref = 0.0f;
+        for (int b = 0; b < nblocks; ++b) {
+            const block_pq2_0 * wb = wrow + b;
+            const block_q8_1  * ab = xq.data() + b * QI_PQ2_0;
+            for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) ref += pq2_0_dot_q8_1_perm(wb, ab, iqs);
+        }
+        check_close(total, ref, 1e-2f, "gemv warp sum == serial sum");
+        CHECK(std::fabs(total) > 1.0f, "gemv row %d produced a non-trivial result", row);
+    }
+
+    int visits = 0;
+    for (int lane = 0; lane < 32; ++lane)
+        for (int b = lane; b < nblocks; b += 32) ++visits;
+    CHECK(visits == nblocks, "lane striding covers each block exactly once (%d vs %d)", visits, nblocks);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Simulate the GEMM block tiling (row/col mapping + k-block loop) and
+//    require an exact match against the reference matmul.
+// ---------------------------------------------------------------------------
+static void test_gemm_tiling() {
+    std::printf("[gemm] tiled matmul\n");
+    std::mt19937 rng(31337);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+
+    const int n_out = 64, n_in = 256, n_tok = 5;
+    const int nblocks = n_in / QK_PQ2_0, nchunk = n_in / QK8_1;
+    std::vector<float> w((size_t)n_out * n_in), x((size_t)n_in * n_tok);
+    for (auto & v : w) v = std::round(ud(rng) * 1.2f);
+    for (auto & v : x) v = ud(rng) * 3.0f;
+
+    std::vector<block_pq2_0> wq((size_t)n_out * nblocks);
+    for (int r = 0; r < n_out; ++r)
+        quantize_row_pq2_0(w.data() + (size_t)r * n_in, wq.data() + (size_t)r * nblocks, n_in);
+
+    // activations, chunk-major [n_in/32][n_tok], each column quantised alone
+    std::vector<block_q8_1> X((size_t)nchunk * n_tok);
+    for (int c = 0; c < nchunk; ++c)
+        for (int t = 0; t < n_tok; ++t) {
+            std::vector<float> one(QK8_1);
+            for (int d = 0; d < QK8_1; ++d) one[d] = x[(size_t)(c * QK8_1 + d) * n_tok + t];
+            std::vector<block_q8_1> tmp(1);
+            quantize_row_q8_1(one.data(), tmp.data(), QK8_1, true);
+            X[(size_t)c * n_tok + t] = tmp[0];
+        }
+
+    const int BM = 32, BN = 16, WARPS = 8, ROWS = WARPS * BM;
+    std::vector<float> Y((size_t)n_out * n_tok, 0.0f);
+    for (int r0 = 0; r0 < n_out; r0 += ROWS)
+        for (int c0 = 0; c0 < n_tok; c0 += BN) {
+            const int ncol = std::min(BN, n_tok - c0);
+            for (int warp = 0; warp < WARPS; ++warp)
+                for (int lane = 0; lane < 32; ++lane) {
+                    const int row = r0 + warp * BM + lane;
+                    if (row >= n_out) continue;
+                    const block_pq2_0 * wrow = wq.data() + (size_t)row * nblocks;
+                    float acc[BN] = {};
+                    for (int b = 0; b < nblocks; ++b)
+                        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
+                            const block_pq2_0 * wb = wrow + b;
+                            for (int j = 0; j < ncol; ++j) {
+                                const block_q8_1 * ab = X.data() + (size_t)(b * QI_PQ2_0 + iqs) * n_tok + (c0 + j);
+                                acc[j] += pq2_0_dot_q8_1_block(wb, ab, iqs);
+                            }
+                        }
+                    for (int j = 0; j < ncol; ++j) Y[(size_t)row * n_tok + (c0 + j)] = acc[j];
+                }
+        }
+
+    double m = 0.0;
+    for (int r = 0; r < n_out; ++r) {
+        std::vector<float> wd(n_in);
+        dequantize_row_pq2_0(wq.data() + (size_t)r * nblocks, wd.data(), n_in);
+        for (int t = 0; t < n_tok; ++t) {
+            double ref = 0.0;
+            for (int b = 0; b < nblocks; ++b)
+                for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
+                    const block_q8_1 & a = X[(size_t)(b * QI_PQ2_0 + iqs) * n_tok + t];
+                    const double da = f16_to_f32(a.d);
+                    for (int j = 0; j < 32; ++j) {
+                        const int jj = iqs * 32 + j;
+                        const int code = (wq[(size_t)r * nblocks + b].qs[jj >> 2] >> ((jj & 3) * 2)) & 3;
+                        const int src = 16 * (j >> 4) + 4 * (j & 3) + ((j >> 2) & 3);
+                        ref += (double)((code - 1) * f16_to_f32(wq[(size_t)r * nblocks + b].d))
+                             * (double)a.qs[src] * da;
+                    }
+                }
+            m = std::fmax(m, std::fabs(Y[(size_t)r * n_tok + t] - ref));
+        }
+    }
+    CHECK(m < 1e-2, "gemm tiled result matches reference (max err %.3e)", m);
+}
+
 int main() {
     test_pq2_0_format();
     test_fwht();
@@ -335,6 +467,8 @@ int main() {
     test_gdn();
     test_attn();
     test_geometry();
+    test_gemv_loop();
+    test_gemm_tiling();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
