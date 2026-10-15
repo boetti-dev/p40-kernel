@@ -18,7 +18,9 @@ zugeschnitten.
 |---|---|
 | `include/bonsai_model.h` | Exakte Geometrie von qwen35 (aus dem GGUF-Header gelesen) |
 | `include/bonsai_p40.h` | Öffentliche C-API der Kernel |
+| `include/bonsai_kv.h` | Öffentliche C-API des KV-Caches |
 | `src/p40_common.h` | Host/Device-Primitive, P40-Konstanten, `dp4a`, fp16↔fp32 |
+| `src/kv_cache.h` | KV-Cache-Geometrie, Sizing, Q8_0-Mathe (host **und** device) |
 | `src/p40_ptx.h` | Handgeschriebene PTX nur dort, wo sie den Speicherpfad/Occupancy betrifft |
 | `src/pq2_0.h` | PQ2_0-Blockformat + `dp4a`-Kern (host **und** device) |
 | `src/fwht.h` | Hadamard-Rotation (Block 1024, normalisiert, Sylvester) |
@@ -27,6 +29,7 @@ zugeschnitten.
 | `src/kernels/gemm_p40.cu` | Prefill-Mat-Mul (DP4A-Tile-GEMM) |
 | `src/kernels/elementwise_p40.cu` | Hadamard + RMSNorm |
 | `src/kernels/attn_p40.cu` | Gated DeltaNet + GQA-Flash-Attention |
+| `src/kernels/kv_p40.cu` | KV-Cache: Append/Quantisierung + Split-K-Decode-Attention |
 | `tests/test_p40.cpp` | Host-Verifikation der gesamten Kernel-Mathematik |
 | `tools/check_gguf.py` | Prüft die Kernel-Konstanten gegen die echte GGUF-Datei |
 | `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |
@@ -85,8 +88,9 @@ $ g++ -O2 -std=c++17 -I src -I include tests/test_p40.cpp -o test_p40 && ./test_
 [gemv] 4-rows-per-warp strided loop
 [gemm] tiled matmul
 [ptx] host fallback path
+[kv] cache sizing, layout, score, split-K
 
-51 passed, 0 failed
+333 passed, 0 failed
 ```
 
 ```

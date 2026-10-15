@@ -40,6 +40,7 @@ struct model_27b {
     static constexpr float rope_base    = 1.0e7f;
     static constexpr float rms_eps      = 1.0e-6f;
     static constexpr int vocab          = 248320;
+    static constexpr int context_len    = 262144;   // qwen35.context_length
 
     static constexpr int full_interval  = 4;
     static constexpr int n_linear       = 48;

@@ -38,7 +38,8 @@ if(BONSAI_BUILD_CUDA)
       src/kernels/gemv_p40.cu
       src/kernels/gemm_p40.cu
       src/kernels/elementwise_p40.cu
-      src/kernels/attn_p40.cu)
+      src/kernels/attn_p40.cu
+      src/kernels/kv_p40.cu)
     target_include_directories(bonsai_p40 PUBLIC include PRIVATE src)
     target_compile_options(bonsai_p40 PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -Xptxas -dlcm=ca>)

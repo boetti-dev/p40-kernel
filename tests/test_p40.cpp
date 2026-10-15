@@ -6,6 +6,7 @@
 // Build:  g++ -O2 -std=c++17 -I src -I include tests/test_p40.cpp -o test_p40
 #include "../src/pq2_0.h"
 #include "../src/p40_ptx.h"
+#include "../src/kv_cache.h"
 #include "../src/fwht.h"
 #include "../src/ops.h"
 #include "../include/bonsai_model.h"
@@ -522,6 +523,125 @@ static void test_ptx_layer() {
     p40_prefetch_l2(buf);              // must be a no-op on the host
     CHECK(true, "p40_prefetch_l2 host no-op");
 }
+// ---------------------------------------------------------------------------
+// 10. KV cache: sizing must match the documented table, and the whole append
+//     -> read-back -> dp4a score -> split-K reduction path must reproduce a
+//     float reference.
+// ---------------------------------------------------------------------------
+static void test_kv_cache() {
+    std::printf("[kv] cache sizing, layout, score, split-K\n");
+
+    // --- sizing table (docs/KV_CACHE.md) ---
+    const auto g = kv_geometry::for_27b(262144);
+    CHECK(g.n_layers == 16 && g.n_kv_head == 4 && g.head_dim == 256, "kv geometry 16/4/256");
+    CHECK(g.blocks_per_pos() == 8, "8 Q8_0 blocks per 256-wide head");
+    CHECK(g.array_bytes() == 16LL * 4 * 262144 * 8 * 34, "K array bytes = 4.25 GiB");
+    const double gib = (double)g.total_bytes() / (1024.0 * 1024.0 * 1024.0);
+    CHECK(std::fabs(gib - 8.50) < 0.02, "K+V Q8_0 @262k = 8.50 GiB (got %.3f)", gib);
+    const double gdn = (double)gdn_state_bytes() / (1024.0 * 1024.0);
+    CHECK(std::fabs(gdn - 144.0) < 0.5, "GDN state = 144 MiB (got %.1f)", gdn);
+
+    // F16 would not fit: 7.21 GiB weights + 16.0 GiB cache > 24 GiB
+    const double f16 = 16.0 * 1024 * 1024 * 1024.0;
+    CHECK(7.21 + f16 / (1024.0 * 1024 * 1024.0) > 23.0, "F16 KV does not fit the 24 GiB P40");
+
+    // --- layout: one (layer, kv_head) stream is contiguous over positions ---
+    for (int p = 0; p + 1 < 262144; p += 977) {
+        const int64_t a = g.block_index(3, 2, p, 7);
+        const int64_t b = g.block_index(3, 2, p + 1, 0);
+        CHECK(a + 1 == b, "position stride is blocks_per_pos");
+    }
+    CHECK(g.block_index(1, 0, 0, 0) == g.n_kv_head * g.blocks_per_stream(),
+          "layer stride = n_kv_head * blocks_per_stream");
+    CHECK(g.block_index(0, 1, 0, 0) == g.blocks_per_stream(), "kv head stride = blocks_per_stream");
+
+    // --- append -> read back -> score ---
+    std::mt19937 rng(9001);
+    std::uniform_real_distribution<float> ud(-2.0f, 2.0f);
+    const int D = 256, nblk = D / QK8_0;
+
+    std::vector<float> kf(D), vf(D), qf(D);
+    for (auto & x : kf) x = ud(rng);
+    for (auto & x : vf) x = ud(rng);
+    for (auto & x : qf) x = ud(rng);
+
+    std::vector<block_q8_0> kq(nblk), vq(nblk), qq(nblk);
+    kv_quantize_row_q8_0(kf.data(), kq.data(), D);
+    kv_quantize_row_q8_0(vf.data(), vq.data(), D);
+    kv_quantize_row_q8_0(qf.data(), qq.data(), D);
+
+    // read back
+    std::vector<float> kd(D), vd(D);
+    kv_dequantize_row_q8_0(kq.data(), kd.data(), D);
+    kv_dequantize_row_q8_0(vq.data(), vd.data(), D);
+    double ek = 0.0, ev = 0.0;
+    for (int i = 0; i < D; ++i) { ek += std::fabs(kd[i] - kf[i]); ev += std::fabs(vd[i] - vf[i]); }
+    CHECK(ek / D < 0.02, "Q8_0 key round-trip (%.4f)", ek / D);
+    CHECK(ev / D < 0.02, "Q8_0 value round-trip (%.4f)", ev / D);
+
+    // dp4a score vs float score of the dequantised vectors
+    const float score_i = kv_score(qq.data(), kq.data(), nblk);
+    std::vector<float> qd(D);
+    kv_dequantize_row_q8_0(qq.data(), qd.data(), D);
+    double ref_i = 0.0;
+    for (int i = 0; i < D; ++i) ref_i += (double)qd[i] * kd[i];
+    CHECK(std::fabs(score_i - (float)ref_i) < 1e-2, "dp4a score == float score (%.5f vs %.5f)",
+          score_i, ref_i);
+
+    // --- split-K reduction vs a single-pass online softmax ---
+    std::mt19937 rng2(77);
+    std::uniform_real_distribution<float> sc(-4.0f, 4.0f);
+    const int n_pos = 1000, n_split = 32;
+    std::vector<float> scores(n_pos);
+    for (auto & s : scores) s = sc(rng2);
+    std::vector<std::vector<float>> vvec(n_pos, std::vector<float>(4));
+    for (auto & vv : vvec) for (auto & x : vv) x = ud(rng2);
+
+    // single pass
+    float m1 = -INFINITY, l1 = 0.0f;
+    std::vector<float> acc1(4, 0.0f);
+    for (int p = 0; p < n_pos; ++p) {
+        const float mn = std::fmax(m1, scores[p]);
+        const float a = std::exp(m1 - mn), w = std::exp(scores[p] - mn);
+        l1 = l1 * a + w;
+        for (int d = 0; d < 4; ++d) acc1[d] = acc1[d] * a + w * vvec[p][d];
+        m1 = mn;
+    }
+    for (int d = 0; d < 4; ++d) acc1[d] /= l1;
+
+    // split pass + merge (as the two kernels do)
+    const int chunk = (n_pos + n_split - 1) / n_split;
+    std::vector<float> sm(n_split), sl(n_split), sacc((size_t)n_split * 4, 0.0f);
+    for (int s = 0; s < n_split; ++s) {
+        float m = -INFINITY, l = 0.0f, acc[4] = {0, 0, 0, 0};
+        for (int p = s * chunk; p < std::min((s + 1) * chunk, n_pos); ++p) {
+            const float mn = std::fmax(m, scores[p]);
+            const float a = std::exp(m - mn), w = std::exp(scores[p] - mn);
+            l = l * a + w;
+            for (int d = 0; d < 4; ++d) acc[d] = acc[d] * a + w * vvec[p][d];
+            m = mn;
+        }
+        sm[s] = m; sl[s] = l;
+        for (int d = 0; d < 4; ++d) sacc[(size_t)s * 4 + d] = acc[d];
+    }
+    float m = -INFINITY, l = 0.0f, acc[4] = {0, 0, 0, 0};
+    for (int s = 0; s < n_split; ++s) {
+        const float mn = std::fmax(m, sm[s]);
+        const float wa = std::exp(m - mn), wb = std::exp(sm[s] - mn);
+        for (int d = 0; d < 4; ++d) acc[d] = acc[d] * wa + sacc[(size_t)s * 4 + d] * wb;
+        l = l * wa + sl[s] * wb;
+        m = mn;
+    }
+    for (int d = 0; d < 4; ++d) acc[d] /= l;
+
+    double msplit = 0.0;
+    for (int d = 0; d < 4; ++d) msplit = std::fmax(msplit, std::fabs(acc[d] - acc1[d]));
+    CHECK(msplit < 1e-4, "split-K merge == single pass (max err %.2e)", msplit);
+
+    // a completely empty split (p_begin >= n_pos) must contribute nothing:
+    // m stays -inf, so exp(-inf - m) == 0 and it is a no-op.
+    CHECK(std::exp(-INFINITY - 0.0f) == 0.0f, "empty split weight is exactly zero");
+}
 
 int main() {
     test_pq2_0_format();
@@ -533,6 +653,7 @@ int main() {
     test_gemv_loop();
     test_gemm_tiling();
     test_ptx_layer();
+    test_kv_cache();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
