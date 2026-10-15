@@ -26,7 +26,7 @@ zugeschnitten.
 | `src/fwht.h` | Hadamard-Rotation (Block 1024, normalisiert, Sylvester) |
 | `src/ops.h` | RMSNorm, RoPE, SwiGLU, Gated-DeltaNet-Schritt, Conv1d |
 | `src/kernels/gemv_p40.cu` | Decode-Mat-Vec (bandbreitenkritisch) |
-| `src/kernels/gemm_p40.cu` | Prefill-Mat-Mul (DP4A-Tile-GEMM) |
+| `src/kernels/gemm_p40.cu` | Prefill-Mat-Mul (DP4A-Tile-GEMM; **Standalone-Fallback, nicht der Fork-MMQ** — siehe `docs/MMQ.md`) |
 | `src/kernels/elementwise_p40.cu` | Hadamard + RMSNorm |
 | `src/kernels/attn_p40.cu` | Gated DeltaNet + GQA-Flash-Attention |
 | `src/kernels/kv_p40.cu` | KV-Cache: Append/Quantisierung + Split-K-Decode-Attention |
@@ -35,6 +35,7 @@ zugeschnitten.
 | `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |
 | `tools/gpu_predict.py` | Decode-/Prefill-Vorhersage für eine beliebige Karte aus Bandbreite/MACs |
 | `docs/MTP.md` | Kann das Modell MTP, kann der Kernel es? (Antwort: Modell ja/Community-Paket, Kernel nein) |
+| `docs/MMQ.md` | Was MMQ auf Pascal ist, warum es hier *nicht* drin ist und wann man es nimmt |
 | `tools/build_p40.sh` | Build für `sm_61` + Host-Tests |
 
 ## 2. Die Karte: warum hier alles anders ist als bei Ampere/Ada
@@ -138,6 +139,12 @@ nur `GGML_TYPE_PQ2_0` mit der qwen35-Geometrie.
   `tools/disasm.sh` ist der vorgesehene Weg, die Behauptungen auf einer
   Maschine mit Toolkit nachzuprüfen (Registerzahl, `LDG.E.U16`, `DP4A`,
   `prefetch`).
+* **Kein MMQ.** Für Prefill ist hier ein eigener, einfacher DP4A-Tile-GEMM
+  (`gemm_p40.cu`, Kachel 256×16) statt der Pascal-getunten MMQ des
+  PrismML-Forks (`mmq-config-pascal.cuh`: I=64, J bis 64,
+  `GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0`, `MMQ_ITER_K`). Beim Bau gegen den Fork
+  sollte **dessen** MMQ verwendet werden. Details und Begründung:
+  `docs/MMQ.md`. Der Abstand zwischen beiden ist **nicht gemessen**.
 * Die Gated-DeltaNet- und Attention-Kernel sind korrekt, aber bewusst einfach
   gehalten: sie sind neben dem 7.2-GB-Gewichtsstream pro Token praktisch
   kostenlos (Zustand ~3 MB), und die volle Attention ist nicht der

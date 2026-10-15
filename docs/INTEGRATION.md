@@ -34,15 +34,33 @@ bonsai_p40_attn(q, k, v, out, /*n_tok=*/n, 24, 4, 256, 1.f/16.f, stream);
 
 ## Variante B — als Backend-Dateien im Fork
 
-1. `src/pq2_0.h`, `src/p40_common.h`, `src/fwht.h`, `src/ops.h` nach
-   `ggml/src/ggml-cuda/bonsai-p40/` kopieren.
-2. `src/kernels/gemv_p40.cu` → ersetzt den Aufruf von
-   `mul_mat_vec_pq2_0_mc(...)` für `sm_61` in `mmvq.cu`.
-3. `src/kernels/gemm_p40.cu` → ersetzt den `PQ2_0`-MMQ-Pfad für `sm_61` in
-   `mmq.cu` (bzw. `mmq-config-pascal.cuh`).
-4. `src/kernels/attn_p40.cu` → GDN-Pfad (`gated_delta_net.cu`) und
+1. `src/pq2_0.h`, `src/p40_common.h`, `src/p40_ptx.h`, `src/fwht.h`, `src/ops.h`,
+   `src/kv_cache.h` nach `ggml/src/ggml-cuda/bonsai-p40/` kopieren.
+2. `src/kernels/gemv_p40.cu` → ersetzt für `sm_61` den Aufruf von
+   `mul_mat_vec_pq2_0_mc(...)` in `mmvq.cu` (Decode, Batch 1).
+3. `src/kernels/attn_p40.cu` → GDN-Pfad (`gated_delta_net.cu`) und
    Full-Attention für `sm_61`.
-5. In `ggml-cuda/CMakeLists.txt` die vier `.cu`-Dateien ergänzen.
+4. `src/kernels/kv_p40.cu` → KV-Cache-Streams.
+5. In `ggml-cuda/CMakeLists.txt` die `.cu`-Dateien ergänzen.
+
+### Wichtig: `gemm_p40.cu` NICHT einhängen — der Fork hat MMQ für Pascal
+
+**Don't replace the fork's MMQ.** Der Fork hat bereits einen Pascal-spezifischen
+PQ2_0-MMQ-Pfad:
+
+```
+ggml/src/ggml-cuda/mmq-config-pascal.cuh:
+  CASE(GGML_TYPE_PQ2_0, 256, 2, 64,  8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, ...)
+  ... I=64, J in {8,16,24,32,40,48,64}, nthreads=256, occupancy=2
+```
+
+`ggml_cuda_mmq_get_config()` fällt für `__CUDA_ARCH__ < VOLTA` genau darauf
+zurück, `ggml_cuda_should_use_mmq()` aktiviert es ab `GGML_CUDA_CC_DP4A` über
+den DP4A-Pfad. Dieser Pfad ist Pascal-getunt und dem mitgelieferten
+`gemm_p40.cu` (256×16-Kachel, eine Zeile pro Lane) **vorzuziehen**.
+
+`src/kernels/gemm_p40.cu` ist deshalb als **Standalone-Fallback** gedacht: nur
+verwenden, wenn ohne den Fork gebaut wird. Siehe `docs/MMQ.md`.
 
 Da der Stack ausschließlich `sm_61` baut, sollte er über
 `__CUDA_ARCH__ == 610` gegated werden, damit die anderen Architekturen des Forks

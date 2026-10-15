@@ -1,5 +1,19 @@
 // gemm_p40.cu -- prefill (batch > 1) PQ2_0 mat-mul.
 //
+// STATUS: this is a STANDALONE FALLBACK, not the Pascal MMQ path.
+//
+// The PrismML fork already ships a Pascal-tuned PQ2_0 MMQ
+// (mmq-config-pascal.cuh: nthreads=256, occupancy=2, I=64 rows, J in
+// {8..64}, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K) and
+// ggml_cuda_mmq_get_config() selects it for __CUDA_ARCH__ < VOLTA.  When
+// building against the fork, use that and do NOT wire this file in -- see
+// docs/MMQ.md and docs/INTEGRATION.md.
+//
+// What this file is for: a self-contained prefill GEMM so the stack can be
+// built and tested without pulling in ggml's MMQ machinery.  It is deliberately
+// simple: one output row per lane, no opaque SRAM layout, no K-pipelining
+// engine.  Expect the fork's MMQ to be faster.
+//
 // Decode is a pure bandwidth problem; prefill is a compute problem, and the
 // P40 has no tensor cores.  The only usable ALU for low-bit matmul on GP102 is
 // INT8 DP4A (128/SM/cycle), so this is a DP4A tile GEMM:
