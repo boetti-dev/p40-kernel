@@ -3,3 +3,7 @@ build/
 *.a
 *.so
 test_p40
+
+# python build artefacts
+__pycache__/
+*.pyc
