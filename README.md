@@ -36,6 +36,9 @@ zugeschnitten.
 | `tools/gpu_predict.py` | Decode-/Prefill-Vorhersage für eine beliebige Karte aus Bandbreite/MACs |
 | `docs/MTP.md` | Kann das Modell MTP, kann der Kernel es? (Antwort: Modell ja/Community-Paket, Kernel nein) |
 | `docs/MMQ.md` | Was MMQ auf Pascal ist, warum es hier *nicht* drin ist und wann man es nimmt |
+| `integrations/prismml/` | **Fertige, applybare Integration in den PrismML-Fork** (Diff + `git am`-Patch) |
+| `src/p40_dispatch_predicate.h` | Die getestete Übernahme-Entscheidung der Fork-Integration |
+| `tools/check_macro_collisions.py` | Findet Namen, die der Fork als Makro definiert (Integrations-Stolperstein) |
 | `tools/build_p40.sh` | Build für `sm_61` + Host-Tests |
 
 ## 2. Die Karte: warum hier alles anders ist als bei Ampere/Ada
@@ -98,9 +101,21 @@ $ g++ -O2 -std=c++17 -I src -I include tests/test_p40.cpp -o test_p40 && ./test_
 
 ```
 $ python3 tools/check_gguf.py Ternary-Bonsai-2-27B-PQ2_0.gguf
-... alle 18 KV- und 14 Tensor-Checks OK ...
+... alle 18 KV- und 14 Tensor-Checks OK, MTP/nextn block: none ...
 All GGUF geometry checks passed.
 ```
+
+**Integration in den PrismML-Fork** (gegen `prism` @ `b858f3b` verifiziert):
+
+```
+$ git clone -b prism https://github.com/PrismML-Eng/llama.cpp && cd llama.cpp
+$ git apply --check /path/integrations/prismml/bonsai-p40.diff   # -> OK, exit 0
+$ git apply         /path/integrations/prismml/bonsai-p40.diff   # -> 11 Dateien, +897
+$ python3 tools/check_macro_collisions.py .                      # -> no macro collisions
+```
+
+Nur **9 Zeilen** ändern Bestandsdateien; der Rest ist neu und liegt isoliert
+unter `ggml/src/ggml-cuda/bonsai-p40/`.
 
 Die Kernel-Mathematik liegt in `BONSAI_HD`-Funktionen (`src/pq2_0.h`), die
 **identisch** von Host und Device kompiliert werden. Der Host-Test führt also
@@ -145,6 +160,14 @@ nur `GGML_TYPE_PQ2_0` mit der qwen35-Geometrie.
   `GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0`, `MMQ_ITER_K`). Beim Bau gegen den Fork
   sollte **dessen** MMQ verwendet werden. Details und Begründung:
   `docs/MMQ.md`. Der Abstand zwischen beiden ist **nicht gemessen**.
+* **Die Fork-Integration ist nicht kompiliert und nicht gebenchmarkt.** In
+  dieser Umgebung gibt es **kein `cmake`** (nur `make`) und **kein `nvcc`**,
+  also ist llama.cpp hier grundsätzlich nicht baubar. Verifiziert sind: der
+  Patch applyt sauber auf einen frischen `prism`-Clone, das Ergebnis ist
+  byte-identisch, es gibt keine Makro-Kollisionen, die Host-Suite läuft
+  standalone **und** mit den Fork-Makros (355/355), und der Include-Graph ist
+  konsistent. **Nicht** verifiziert: CUDA-Kompilierbarkeit und der
+  Geschwindigkeitsvorteil. Bitte zuerst `llama-bench` A/B fahren.
 * Die Gated-DeltaNet- und Attention-Kernel sind korrekt, aber bewusst einfach
   gehalten: sie sind neben dem 7.2-GB-Gewichtsstream pro Token praktisch
   kostenlos (Zustand ~3 MB), und die volle Attention ist nicht der

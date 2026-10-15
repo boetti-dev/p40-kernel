@@ -47,9 +47,9 @@ gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
                                       float * __restrict__ Y,
                                       const int n_out, const int n_tok,
                                       const int nblocks) {
-    __shared__ __align__(16) int8_t X_s[QI_PQ2_0 * GEMM_BN * 32];
-    __shared__ float   D_s[QI_PQ2_0 * GEMM_BN];
-    __shared__ int     S_s[QI_PQ2_0 * GEMM_BN];
+    __shared__ __align__(16) int8_t X_s[BONSAI_QI_PQ2_0 * GEMM_BN * 32];
+    __shared__ float   D_s[BONSAI_QI_PQ2_0 * GEMM_BN];
+    __shared__ int     S_s[BONSAI_QI_PQ2_0 * GEMM_BN];
 
     const int row0 = blockIdx.x * GEMM_ROWS;
     const int col0 = blockIdx.y * GEMM_BN;
@@ -68,11 +68,11 @@ gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
     for (int b = 0; b < nblocks; ++b) {
         // ---- stage the activation slab for k-block b --------------------
         __syncthreads();
-        for (int i = threadIdx.x; i < QI_PQ2_0 * GEMM_BN; i += blockDim.x) {
+        for (int i = threadIdx.x; i < BONSAI_QI_PQ2_0 * GEMM_BN; i += blockDim.x) {
             const int iqs = i / GEMM_BN;
             const int j   = i % GEMM_BN;
             if (j < ncol) {
-                const block_q8_1 * src = X + (size_t)(b * QI_PQ2_0 + iqs) * n_tok + (col0 + j);
+                const block_q8_1 * src = X + (size_t)(b * BONSAI_QI_PQ2_0 + iqs) * n_tok + (col0 + j);
                 // 32 bytes: copy as eight int32 (`qs` is only 4-byte aligned).
                 const uint32_t * sp = (const uint32_t *)src->qs;
                 uint32_t * dp = (uint32_t *)(X_s + i * 32);
@@ -96,7 +96,7 @@ gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
         const uint16_t * qp = (const uint16_t *)wrow[b].qs;
 
 #pragma unroll
-        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
+        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) {
             const uint32_t w0 = (uint32_t)qp[iqs * 4 + 0] | ((uint32_t)qp[iqs * 4 + 1] << 16);
             const uint32_t w1 = (uint32_t)qp[iqs * 4 + 2] | ((uint32_t)qp[iqs * 4 + 3] << 16);
             const int t0 = (int)((w0 >> 0) & 0x03030303u);
@@ -142,9 +142,9 @@ gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
 
 int bonsai_p40_gemm(const void * W, const void * Xq, float * Y,
                     int64_t n_out, int64_t n_in, int64_t n_tok, bonsai_stream stream) {
-    if (n_in <= 0 || n_in % QK_PQ2_0 != 0) return 1;
+    if (n_in <= 0 || n_in % BONSAI_QK_PQ2_0 != 0) return 1;
     if (n_out <= 0 || n_tok <= 0) return 0;
-    const int nblocks = (int)(n_in / QK_PQ2_0);
+    const int nblocks = (int)(n_in / BONSAI_QK_PQ2_0);
     dim3 grid((unsigned)((n_out + GEMM_ROWS - 1) / GEMM_ROWS),
               (unsigned)((n_tok + GEMM_BN - 1) / GEMM_BN));
     gemm_pq2_0_p40_kernel<<<grid, GEMM_WARPS * 32, 0, (cudaStream_t)stream>>>(

@@ -51,11 +51,17 @@
 
 namespace bonsai {
 
-static constexpr int QK8_0 = 32;
+// Same macro-collision rule as in pq2_0.h: the fork's ggml-common.h
+// #defines QK8_0, so we must not declare that name ourselves.
+#ifdef QK8_0
+static constexpr int BONSAI_QK8_0 = QK8_0;           // inherit ggml's value
+#else
+static constexpr int BONSAI_QK8_0 = 32;
+#endif
 
 struct block_q8_0 {                              // 34 bytes
     uint16_t d;                                  // fp16 scale
-    int8_t   qs[QK8_0];
+    int8_t   qs[BONSAI_QK8_0];
 };
 
 // ---------------------------------------------------------------------------
@@ -72,7 +78,7 @@ struct kv_geometry {
                            model_27b::head_dim, capacity};
     }
 
-    int     blocks_per_pos()    const { return head_dim / QK8_0; }              // 8
+    int     blocks_per_pos()    const { return head_dim / BONSAI_QK8_0; }              // 8
     int64_t blocks_per_stream() const { return (int64_t)capacity * blocks_per_pos(); }
     int64_t k_blocks()          const { return (int64_t)n_layers * n_kv_head * blocks_per_stream(); }
     int64_t array_bytes()       const { return k_blocks() * (int64_t)sizeof(block_q8_0); }
@@ -97,14 +103,14 @@ inline int64_t gdn_state_bytes() {
 // Same Q8_0 block as everywhere in llama.cpp: d = amax/127.
 // ---------------------------------------------------------------------------
 inline void kv_quantize_row_q8_0(const float * x, block_q8_0 * y, int n) {
-    for (int b = 0; b < n / QK8_0; ++b) {
-        const float * src = x + b * QK8_0;
+    for (int b = 0; b < n / BONSAI_QK8_0; ++b) {
+        const float * src = x + b * BONSAI_QK8_0;
         float amax = 0.0f;
-        for (int i = 0; i < QK8_0; ++i) amax = fmaxf(amax, fabsf(src[i]));
+        for (int i = 0; i < BONSAI_QK8_0; ++i) amax = fmaxf(amax, fabsf(src[i]));
         const float d  = amax / 127.0f;
         const float id = d > 0.0f ? 1.0f / d : 0.0f;
         y[b].d = f32_to_f16(d);
-        for (int i = 0; i < QK8_0; ++i) {
+        for (int i = 0; i < BONSAI_QK8_0; ++i) {
             int v = (int)lroundf(src[i] * id);
             if (v < -127) { v = -127; }
             if (v >  127) { v =  127; }
@@ -114,9 +120,9 @@ inline void kv_quantize_row_q8_0(const float * x, block_q8_0 * y, int n) {
 }
 
 inline void kv_dequantize_row_q8_0(const block_q8_0 * x, float * y, int n) {
-    for (int b = 0; b < n / QK8_0; ++b) {
+    for (int b = 0; b < n / BONSAI_QK8_0; ++b) {
         const float d = f16_to_f32(x[b].d);
-        for (int i = 0; i < QK8_0; ++i) y[b * QK8_0 + i] = (float)x[b].qs[i] * d;
+        for (int i = 0; i < BONSAI_QK8_0; ++i) y[b * BONSAI_QK8_0 + i] = (float)x[b].qs[i] * d;
     }
 }
 
@@ -126,7 +132,7 @@ inline void kv_dequantize_row_q8_0(const block_q8_0 * x, float * y, int n) {
 // ---------------------------------------------------------------------------
 BONSAI_HD inline float kv_dot_q8_0_block(const block_q8_0 * a, const block_q8_0 * b) {
     int sumi = 0;
-    for (int w = 0; w < QK8_0 / 4; ++w) {
+    for (int w = 0; w < BONSAI_QK8_0 / 4; ++w) {
         int av, bv;
         std::memcpy(&av, a->qs + w * 4, 4);
         std::memcpy(&bv, b->qs + w * 4, 4);

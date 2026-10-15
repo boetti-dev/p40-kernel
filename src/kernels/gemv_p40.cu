@@ -68,7 +68,7 @@ gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
     for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) acc[r] = 0.0f;
 
     for (int b = lane; b < nblocks; b += 32) {
-        const block_q8_1 * ab = X + (size_t)b * QI_PQ2_0;
+        const block_q8_1 * ab = X + (size_t)b * BONSAI_QI_PQ2_0;
 
         // Keep the weight stream ahead of the dp4a consumers.  All four rows
         // are prefetched (each is a separate stream), clamped to the row so the
@@ -84,7 +84,7 @@ gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
             dw[r] = f16_to_f32(p40_ldg_u16(&wr[r][b].d));
 
 #pragma unroll
-        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
+        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) {
             // Activations: 32 bytes at 4-byte alignment -> eight int32 loads.
             const int * ap = (const int *)ab[iqs].qs;
             const int a0 = ap[0], a1 = ap[1], a2 = ap[2], a3 = ap[3];
@@ -139,7 +139,7 @@ quant_q8_1_pq2_kernel(const float * __restrict__ x, block_q8_1 * __restrict__ y,
     const int nwarp = gridDim.x * GEMV_WARPS_PER_BLOCK;
 
     for (int c = warp; c < nchunk; c += nwarp) {
-        const float v = x[c * QK8_1 + lane];
+        const float v = x[c * BONSAI_QK8_1 + lane];
 
         float amax = fabsf(v);
 #pragma unroll
@@ -164,8 +164,8 @@ quant_q8_1_pq2_kernel(const float * __restrict__ x, block_q8_1 * __restrict__ y,
 } // namespace
 
 int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_stream stream) {
-    if (n <= 0 || n % QK8_1 != 0) return 1;
-    const int nchunk = (int)(n / QK8_1);
+    if (n <= 0 || n % BONSAI_QK8_1 != 0) return 1;
+    const int nchunk = (int)(n / BONSAI_QK8_1);
     const int warps  = (nchunk + 3) / 4;                 // ~4 chunks per warp
     const int blocks = (warps + GEMV_WARPS_PER_BLOCK - 1) / GEMV_WARPS_PER_BLOCK;
     quant_q8_1_pq2_kernel<<<blocks, GEMV_WARPS_PER_BLOCK * 32, 0, (cudaStream_t)stream>>>(
@@ -175,9 +175,9 @@ int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_
 
 int bonsai_p40_gemv(const void * W, const void * xq, float * y,
                     int64_t n_out, int64_t n_in, bonsai_stream stream) {
-    if (n_in <= 0 || n_in % QK_PQ2_0 != 0) return 1;
+    if (n_in <= 0 || n_in % BONSAI_QK_PQ2_0 != 0) return 1;
     if (n_out <= 0) return 0;
-    const int nblocks = (int)(n_in / QK_PQ2_0);
+    const int nblocks = (int)(n_in / BONSAI_QK_PQ2_0);
     const int blocks  = (int)((n_out + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
     gemv_pq2_0_p40_kernel<<<blocks, GEMV_WARPS_PER_BLOCK * 32, 0, (cudaStream_t)stream>>>(
         (const block_pq2_0 *)W, (const block_q8_1 *)xq, y, (int)n_out, nblocks);

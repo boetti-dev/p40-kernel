@@ -136,80 +136,107 @@ PQ2_0-Kernel des Forks gibt es so etwas nicht.
 
 ---
 
-## Teil D — Einbindung Schritt für Schritt
+## Teil D — Einbindung
+
+> **Es gibt eine fertige, applybare Integration:** `integrations/prismml/`
+> (Diff + `git am`-Patch, gegen `prism` @ `b858f3b` verifiziert).
+> Die folgende Beschreibung erklärt, was sie tut.
 
 ### D0 — Der wichtigste Vorbehalt (bitte zuerst lesen)
 
 **Mein GEMV erwartet vorquantisierte Aktivierungen** im PQ2_0-nativen
 Q8_1-Layout (`bonsai_p40_quant_activations`). **llama.cpp quantisiert im
 Kernel**: `mul_mat_vec_q` wandelt `x` selbst nach q8_1 in Shared Memory um.
-Ein reiner Kernel-Tausch funktioniert deshalb **nicht**. Zwei Wege:
+Ein reiner Kernel-Tausch funktioniert deshalb **nicht**. Die fertige Integration
+löst das, indem sie **beide** Kernel nacheinander ruft (Quantisieren in einen
+32-KiB-Scratch, dann Mat-Vec) — das ist Weg 2 unten und kostet einen
+zusätzlichen Launch pro Layer.
 
-* **Weg 1 (empfohlen):** die bestehende In-Kernel-Quantisierung um die
-  PQ2_0-Permutation erweitern und die 4-Zeilen-Struktur dort einbauen. Der
-  Permutations-Index ist exakt
-  `16*(j>>4) + 4*(j&3) + ((j>>2)&3)` (siehe `quantize_row_q8_1(..., permute=true)`).
-* **Weg 2:** `bonsai_p40_quant_activations` als separaten Kernel vor den
-  Mat-Vec hängen und `x` als eigenes Tensor halten. Einfacher, kostet einen
-  zusätzlichen Launch pro Layer.
+Würde man stattdessen nur den Mat-Vec tauschen, passten Code-Wort und
+Aktivierungs-Byte nicht zusammen und das Ergebnis wäre **still falsch** — genau
+der Bug, den `[pq2_0] format + dp4a dot` in der Host-Suite abfängt.
 
-Ohne diesen Schritt passen Code-Wort und Aktivierungs-Byte nicht zusammen und
-das Ergebnis ist still falsch — genau der Bug, den die Host-Suite in
-`[pq2_0] format + dp4a dot` abfängt.
+### D1 — Einhängepunkt: `ggml-cuda.cu`, nicht `mmvq.cu`
 
-### D1 — Dateien kopieren
-
-```bash
-mkdir -p ggml/src/ggml-cuda/bonsai-p40
-cp src/pq2_0.h src/p40_common.h src/p40_ptx.h src/kv_cache.h \
-   ggml/src/ggml-cuda/bonsai-p40/
-cp src/kernels/gemv_p40.cu src/kernels/kv_p40.cu ggml/src/ggml-cuda/bonsai-p40/
-cp include/bonsai_p40.h include/bonsai_kv.h include/bonsai_model.h \
-   ggml/include/bonsai/
-```
-
-`gemm_p40.cu`, `elementwise_p40.cu`, `attn_p40.cu` **nicht** kopieren (Teil B).
-
-### D2 — Einhängepunkt im Decode
-
-Der Dispatch sitzt in `ggml/src/ggml-cuda/mmvq.cu`. Dort, wo für
-`ncols_dst == 1` der generische `mul_mat_vec_q` gewählt wird, für `sm_61`
-abzweigen:
+**Korrektur zu einer früheren Fassung dieses Dokuments:** dort stand, man solle
+`mmvq.cu` patchen. Das ist der falsche Ort — `mmvq.cu` ist stark templatisiert
+und gefused (Fusion, MoE, SoA-Layouts), ein Hook dort wäre kaum prüfbar. Der
+saubere Punkt ist `ggml_cuda_mul_mat()` in `ggml/src/ggml-cuda/ggml-cuda.cu`,
+unmittelbar vor dem Stock-`mmvq`-Zweig:
 
 ```c
-// ggml/src/ggml-cuda/mmvq.cu  (Skizze -- an die tatsächliche
-// Signatur der Launcher-Funktion anpassen)
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 610)
-    if (type == GGML_TYPE_PQ2_0 && ncols_dst == 1) {
-        // x muss bereits im PQ2_0-nativen Q8_1-Layout vorliegen (siehe D0)
-        return bonsai_p40_gemv(vx, vy_pq2, dst, nrows_x, ncols_x, stream);
+    if (bonsai_p40_should_use(src0->type, cc, ne11) &&
+            bonsai_p40_mul_mat(src0, src1, dst, ctx.stream())) {
+        return;
     }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) { ... }   // unverändert
+```
+
+`bonsai_p40_mul_mat()` gibt `false` zurück, sobald irgendetwas nicht exakt
+passt, und dann läuft alles unverändert weiter.
+
+### D2 — Die Übernahme-Entscheidung ist eine getestete Funktion
+
+Der einzige Gate, der den Kernel aktiviert, liegt in
+`src/p40_dispatch_predicate.h` als **reine C++-Funktion ohne ggml- und
+CUDA-Typen**:
+
+```cpp
+bool p40_decode_path_ok(const p40_mulmat_shape & s);
+```
+
+Damit ist sie host-testbar — `[dispatch] PrismML MUL_MAT takeover predicate`
+prüft alle sechs echten Zeilenbreiten des Modells und **14 Ablehnungsgründe**
+(falscher Typ, `GGML_TYPE_Q2_0` statt PQ2_0, Batch > 1, MoE/3D, nicht
+zusammenhängender Zeilenstride, `n_in` nicht Vielfaches von 128, …). Ein
+falsches „ja" würde still falsche Ergebnisse liefern; deshalb ist das getestet
+und nicht inline.
+
+### D3 — Makro-Kollisionen (der Stolperstein)
+
+Der Fork definiert in `ggml-common.h` die **Makros** `QK_PQ2_0`, `QK8_1`,
+`QK8_0`. Deklariert man dieselben Namen als Konstanten, ersetzt der
+Präprozessor sie und aus `static constexpr int QK8_1 = 32;` wird
+`static constexpr int 32 = 32;`:
+
+```
+<command-line>: error: expected unqualified-id before numeric constant
+```
+
+Alle eigenen Konstanten heißen deshalb `BONSAI_*` und **erben** die Werte des
+Forks, wenn er vorhanden ist:
+
+```cpp
+#ifdef QK8_1
+static constexpr int BONSAI_QK8_1 = QK8_1;   // inherit ggml's value
+#else
+static constexpr int BONSAI_QK8_1 = 32;
 #endif
 ```
 
-Der Host-Teil (`ggml_cuda_mul_mat_vec_q` in `ggml-cuda.cu`) muss dieselbe
-Bedingung prüfen und ggf. `bonsai_p40_quant_activations` vorschalten (Weg 2).
-
-### D3 — Arch-Gating
-
-Alles hinter `__CUDA_ARCH__ == 610` kapseln. Der Stack baut **nur** `sm_61`;
-andere Architekturen des Forks dürfen unberührt bleiben. Build:
-`-gencode arch=compute_61,code=sm_61`.
+`tools/check_macro_collisions.py <fork>` prüft das gegen **1882** Fork-Makros
+und muss `no macro collisions` liefern. Aktuell: 0 Kollisionen.
 
 ### D4 — CMake
 
+`ggml/src/ggml-cuda/CMakeLists.txt` globt nur `*.cu` im Top-Level, also braucht
+das Unterverzeichnis zwei Zeilen:
+
 ```cmake
-# ggml/src/ggml-cuda/CMakeLists.txt
-if (CMAKE_CUDA_ARCHITECTURES MATCHES "61")
-    target_sources(ggml-cuda PRIVATE
-        bonsai-p40/gemv_p40.cu
-        bonsai-p40/kv_p40.cu)      # kv nur bei Weg "eigener Cache"
-endif()
+file(GLOB   SRCS "bonsai-p40/*.cu")
+list(APPEND GGML_SOURCES_CUDA ${SRCS})
+file(GLOB   SRCS_BONSAI_HDRS "bonsai-p40/*.h" "bonsai-p40/*.cuh")
+list(APPEND GGML_HEADERS_CUDA ${SRCS_BONSAI_HDRS})
 ```
 
-### D5 — Loader-Constraint + Pre-Flight
+### D5 — Arch-Gating
 
-Der Kernel gilt nur für **genau** diese Datei. `tools/check_gguf.py` prüft:
+Der Kernel ist auf `cc == 610` und ein Shape-Prädikat begrenzt; auf jeder
+anderen GPU liefert `bonsai_p40_should_use()` `false` und es ändert sich
+nichts. `sm_61` ist in den Default-Arch-Listen des Forks enthalten
+(`61-virtual`).
+
+### D6 — Loader-Constraint + Pre-Flight
 
 ```bash
 python3 tools/check_gguf.py models/Ternary-Bonsai-2-27B-PQ2_0.gguf
@@ -218,12 +245,10 @@ python3 tools/check_gguf.py models/Ternary-Bonsai-2-27B-PQ2_0.gguf
 
 Harte Ablehnung, wenn `general.architecture != "qwen35"`, ein großes Tensor
 nicht `GGML_TYPE_PQ2_0` (142) ist, oder die Geometrie von
-`include/bonsai_model.h` abweicht (block_count 64, embd 5120, ff 17408,
-heads 24/4, head_dim 256, ssm state 128 / groups 16 / inner 6144,
-hadamard block 1024). **Ein `nextn`/MTP-Block wird als inkompatibel gemeldet**
-(Exit 1) — siehe `docs/MTP.md`.
+`include/bonsai_model.h` abweicht. **Ein `nextn`/MTP-Block wird als
+inkompatibel gemeldet** (Exit 1) — siehe `docs/MTP.md`.
 
-### D6 — Variante: als eigenständige Library
+### D7 — Variante: als eigenständige Library
 
 ```bash
 ./tools/build_p40.sh          # -> build/libbonsai_p40.a + Host-Tests

@@ -1,0 +1,982 @@
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index b687cd5..83b934c 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -103,6 +103,10 @@ if (CUDAToolkit_FOUND)
+     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
+ 
+     file(GLOB   GGML_SOURCES_CUDA "*.cu")
++    file(GLOB   SRCS "bonsai-p40/*.cu")
++    list(APPEND GGML_SOURCES_CUDA ${SRCS})
++    file(GLOB   SRCS_BONSAI_HDRS "bonsai-p40/*.h" "bonsai-p40/*.cuh")
++    list(APPEND GGML_HEADERS_CUDA ${SRCS_BONSAI_HDRS})
+     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
+     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/README.md b/ggml/src/ggml-cuda/bonsai-p40/README.md
+new file mode 100644
+index 0000000..d7c4aa3
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/README.md
+@@ -0,0 +1,89 @@
++# bonsai-p40 — PQ2_0 decode path for the Tesla P40 (sm_61)
++
++Opt-in specialization of the **batch-1 PQ2_0 mat-vec** for the NVIDIA Tesla P40
++(GP102, `sm_61`). Everything here is guarded by `cc == 610`; on any other GPU
++`bonsai_p40_should_use()` returns false and ggml uses the stock path unchanged.
++
++## Why this exists
++
++The fork has PQ2_0 decode tuning for **GB10** (prefetch + wider block, gated on
++`MMVQ_PARAMETERS_GB10`) and an Ada-tuned 3–8-column kernel
++(`mmvq-pq2_0.cuh`). For Pascal, `get_mmvq_parameters_table()` returns
++`MMVQ_PARAMETERS_GENERIC`, so PQ2_0 decode on a P40 runs the generic
++`mul_mat_vec_q` with `VDR_PQ2_0_Q8_1_MMVQ = 1`.
++
++This kernel is the missing sm_61 case:
++
++| | stock on Pascal | here |
++|---|---|---|
++| output rows per warp | 1 | **4** (4 independent weight streams) |
++| activation loads | per row | **1× per 4 rows** |
++| `+1` code bias | per row | **folded, 1× per chunk** |
++| weight scale `d` | per chunk | hoisted out of the chunk loop |
++| load path | generic | `ld.global.nc` + `prefetch.global.L2` |
++| occupancy | generic table | `__launch_bounds__(256,4)` = 32 warps/SM |
++
++Decode is bandwidth-bound on the P40 (7.21 GB per token / 346 GB/s = 20.8 ms
++floor), so the only lever is memory-level parallelism — which is exactly what
++the four rows per warp buy.
++
++## Files
++
++| file | role |
++|---|---|
++| `bonsai_p40_dispatch.cuh/.cu` | the hook: shape guards + quantise + mat-vec |
++| `gemv_p40.cu` | the kernel (`gemv_pq2_0_p40_kernel`) + the activation quantiser |
++| `pq2_0.h` | PQ2_0 block format and the DP4A core (host **and** device) |
++| `p40_common.h` | P40 constants, `dp4a`, fp16 conversions |
++| `p40_ptx.h` | `ld.global.nc`, `dp4a.u32.s32`, `prefetch.global.L2` |
++| `bonsai_p40.h` | the C API used by the dispatch |
++
++## Hook point
++
++`ggml/src/ggml-cuda/ggml-cuda.cu`, in `ggml_cuda_mul_mat()`, immediately before
++the stock mmvq branch:
++
++```c
++    if (bonsai_p40_should_use(src0->type, cc, ne11) &&
++            bonsai_p40_mul_mat(src0, src1, dst, ctx.stream())) {
++        return;
++    }
++    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) { ... }
++```
++
++`mmvq.cu` itself is deliberately **not** touched: it is heavily templated and
++fused, and a wrong hook there would be hard to review.
++
++## Scope and limits (read before trusting numbers)
++
++* Handles only: `GGML_TYPE_PQ2_0` weights, `src1` F32 with one column, plain 2D
++  MUL_MAT, contiguous rows, `n_in <= 32768` and a multiple of 128. Anything else
++  falls through to the stock path, so correctness for other shapes is
++  unaffected.
++* The GLU-fused call sites (`ggml-cuda.cu` ~line 4125/4218/4286/... call
++  `ggml_cuda_mul_mat_vec_q` directly) bypass `ggml_cuda_mul_mat()` and therefore
++  keep using the stock path. Correct, just not accelerated.
++* The activation scratch is a single lazily `cudaMalloc`ed buffer sized for the
++  model's widest row (32768). One model, one GPU.
++* **Not benchmarked.** Neither a P40 nor `nvcc` was available where this was
++  written, so the speedup versus the stock path is argued from the structure
++  (MLP, folded bias, occupancy), not measured. Verify with `llama-bench`:
++
++  ```bash
++  llama-bench -m Ternary-Bonsai-2-27B-PQ2_0.gguf -ngl 99 -fa on -p 0 -n 128
++  ```
++
++  and compare with the same build where `bonsai_p40_should_use()` returns false.
++
++## Build
++
++Nothing to configure — the CMake glob picks the directory up. Build the CUDA
++backend with `sm_61` in the arch list (it is in the default set):
++
++```bash
++cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61
++cmake --build build -j
++```
++
++Full background and the verification suite live in the upstream repo this was
++developed in; see `docs/P40_OPTIMIZATION.md` and `docs/INTEGRATION.md` there.
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h
+new file mode 100644
+index 0000000..2146e09
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h
+@@ -0,0 +1,53 @@
++// bonsai_p40.h -- public C API of the Bonsai-P40 compute kernels.
++//
++// This library contains ONE forward path: Ternary-Bonsai-2-27B (qwen35) in the
++// PQ2_0 ("q2_0") packing, running on an NVIDIA Tesla P40 (sm_61).  There is no
++// code path for any other model, quantisation, or GPU.
++#pragma once
++
++#include <cstdint>
++#include <cstddef>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// Opaque stream handle so the header stays free of CUDA types.
++typedef void * bonsai_stream;
++
++// --- decode (batch = 1) matrix-vector ---------------------------------------
++// y[n_out] = W[n_out, n_in] . x, where W is PQ2_0 and x has already been
++// quantised to the PQ2_0-native Q8_1 layout by bonsai_p40_quant_activations().
++int bonsai_p40_gemv(const void * W, const void * xq, float * y,
++                    int64_t n_out, int64_t n_in, bonsai_stream stream);
++
++// Quantise `n` floats to the permuted Q8_1 activation layout.
++int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_stream stream);
++
++// --- prefill (batch > 1) batched matmul -------------------------------------
++// Y[n_out, n_tok] = W[n_out, n_in] . X[n_in, n_tok], X in permuted Q8_1.
++int bonsai_p40_gemm(const void * W, const void * Xq, float * Y,
++                    int64_t n_out, int64_t n_in, int64_t n_tok, bonsai_stream stream);
++
++// --- fused elementwise / transform kernels ----------------------------------
++// Activation Hadamard rotation (block 1024) with an explicit +-1 sign vector.
++int bonsai_p40_fwht(float * x, const float * signs, int64_t n, bonsai_stream stream);
++
++// RMSNorm over rows of length n.
++int bonsai_p40_rmsnorm(const float * x, const float * w, float * y,
++                       int64_t n_rows, int64_t n, float eps, bonsai_stream stream);
++
++// Gated DeltaNet recurrent step for the linear-attention layers (GQA: n_v_heads
++// value heads share n_k_heads key heads).
++int bonsai_p40_gdn_step(float * state, const float * q, const float * k, const float * v,
++                        const float * g, const float * beta, float * out,
++                        int n_k_heads, int n_v_heads, int K, int V, bonsai_stream stream);
++
++// Causal flash attention for the full-attention layers (GQA n_head/n_head_kv).
++int bonsai_p40_attn(const float * q, const float * k, const float * v, float * out,
++                    int n_tok, int n_head, int n_head_kv, int head_dim, float scale,
++                    bonsai_stream stream);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
+new file mode 100644
+index 0000000..78f0d6e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
+@@ -0,0 +1,78 @@
++// bonsai_p40_dispatch.cu -- see bonsai_p40_dispatch.cuh.
++//
++// Why this is a separate translation unit at all: it lets the P40 path be a
++// drop-in addition.  If anything about the tensor shapes is not exactly what
++// the kernel supports, bonsai_p40_mul_mat() returns false and ggml falls back
++// to the stock mmvq path, so the integration cannot silently produce wrong
++// results for other models or shapes.
++#include "bonsai_p40_dispatch.cuh"
++#include "bonsai_p40.h"
++#include "pq2_0.h"
++#include "p40_common.h"
++#include "p40_dispatch_predicate.h"
++
++#include <cuda_runtime.h>
++
++using namespace bonsai;
++
++namespace {
++
++// The widest row in Ternary-Bonsai-2-27B is feed_forward_length = 17408.
++// P40_MAX_ROW (32768, in p40_dispatch_predicate.h) leaves headroom and costs
++// 32 KiB of scratch.
++constexpr int BONSAI_P40_CC = 610;   // Tesla P40 / GP102, sm_61
++
++// Lazily allocated activation scratch, quantised into the PQ2_0-native layout.
++// One model, one GPU, so a single buffer is enough; no context plumbing needed.
++block_q8_1 * g_scratch = nullptr;
++
++} // namespace
++
++bool bonsai_p40_should_use(enum ggml_type type, int cc, int64_t ne11) {
++    return type == GGML_TYPE_PQ2_0 && cc == BONSAI_P40_CC && ne11 == 1;
++}
++
++bool bonsai_p40_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1,
++                        struct ggml_tensor * dst, cudaStream_t stream) {
++    if (src0 == nullptr || src1 == nullptr || dst == nullptr) return false;
++
++    // The takeover decision is a pure function of the shapes, and it is
++    // unit-tested on the host (tests: [dispatch] ...).  A wrong "yes" here would
++    // silently corrupt results, so it lives in its own header, not inline.
++    p40_mulmat_shape s{};
++    s.type0 = (int)src0->type;
++    s.type1 = (int)src1->type;
++    s.type2 = (int)dst->type;
++    s.n_in  = src0->ne[0];
++    s.n_out = src0->ne[1];
++    s.ne20  = src0->ne[2];
++    s.ne30  = src0->ne[3];
++    s.ne11  = src1->ne[1];
++    s.ne12  = src1->ne[2];
++    s.ne13  = src1->ne[3];
++    s.dst_ne1 = dst->ne[1];
++    s.nb1   = src0->nb[1];
++    if (!p40_decode_path_ok(s)) return false;
++
++    const int64_t n_in  = s.n_in;
++    const int64_t n_out = s.n_out;
++
++    if (g_scratch == nullptr) {
++        const size_t bytes = (size_t)(P40_MAX_ROW / P40_QK_PQ2_0) * sizeof(block_q8_1);
++        if (cudaMalloc((void **)&g_scratch, bytes) != cudaSuccess) {
++            g_scratch = nullptr;
++            return false;
++        }
++    }
++
++    // 1. activations -> PQ2_0-native Q8_1 layout, 2. mat-vec
++    if (bonsai_p40_quant_activations((const float *)src1->data, g_scratch, n_in,
++                                     (bonsai_stream)stream) != 0) {
++        return false;
++    }
++    if (bonsai_p40_gemv(src0->data, g_scratch, (float *)dst->data, n_out, n_in,
++                        (bonsai_stream)stream) != 0) {
++        return false;
++    }
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cuh b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cuh
+new file mode 100644
+index 0000000..bd043b1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cuh
+@@ -0,0 +1,22 @@
++// bonsai_p40_dispatch.cuh -- opt-in hook for the sm_61-only PQ2_0 decode path.
++//
++// Deliberately tiny and self-contained so the fork's hot, heavily templated
++// mmvq.cu stays untouched.  ggml_cuda_mul_mat() calls bonsai_p40_should_use()
++// and, if it agrees, bonsai_p40_mul_mat(); otherwise nothing changes.
++//
++// See ggml/src/ggml-cuda/bonsai-p40/README.md.
++#pragma once
++
++#include "ggml.h"
++
++#include <cuda_runtime.h>
++#include <cstdint>
++
++// True only for the exact case this kernel implements: PQ2_0 weights, a single
++// output column (decode), and a Pascal P40 (sm_61).
++bool bonsai_p40_should_use(enum ggml_type type, int cc, int64_t ne11);
++
++// Runs the decode mat-vec.  Returns true if `dst` was written; false means the
++// caller must fall through to the stock path.
++bool bonsai_p40_mul_mat(const struct ggml_tensor * src0, const struct ggml_tensor * src1,
++                        struct ggml_tensor * dst, cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu b/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
+new file mode 100644
+index 0000000..c54dd8a
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
+@@ -0,0 +1,185 @@
++// gemv_p40.cu -- decode (batch = 1) PQ2_0 mat-vec, the bandwidth-critical
++// kernel of the whole engine.
++//
++// COST MODEL (why the kernel looks like this)
++// -------------------------------------------
++// Per token the whole ~7.2 GB PQ2_0 weight set must cross the GDDR5:
++//   7.21e9 B / 346e9 B/s = 20.8 ms  ->  48 tok/s ceiling.
++// Everything else is noise: activations are ~5 KB, Hadamard/RMSNorm/GDN are
++// O(10^7) ops, and the whole token needs ~0.45 G warp-instructions (~2.4 ms of
++// issue against the P40's 184 G warp-inst/s).  The only thing worth tuning is
++// memory-level parallelism on the weight stream.
++//
++// Three levers, all applied here:
++//
++//  1. 4 output rows per warp.  The activation bytes of a 128-weight block are
++//     fetched once and reused by all four rows, and the warp keeps four
++//     independent weight streams in flight instead of one.  At ~600 ns GDDR5
++//     latency a warp needs several outstanding cache lines: with 30 SMs x 24
++//     warps x 4 lines x 128 B ~ 3.7 MB in flight, versus the ~208 KB the loop
++//     actually has to keep in flight to reach 346 GB/s.
++//  2. The +1 code bias is folded into one `bias = -sum(a)` per 32-element chunk
++//     (one int16 load + negate) and reused by all four rows, instead of a
++//     fetch + subtract per row.
++//  3. The weight scale `d` is loaded once per row per block, outside the chunk
++//     loop.
++//
++// The weight fetch stays 4x uint16 per 8 code bytes: `block_pq2_0` is a 34-byte
++// struct, so `qs` is only 2-byte aligned and a uint32/int4 load would be a
++// misaligned access on Pascal.
++#include "pq2_0.h"
++#include "p40_common.h"
++#include "p40_ptx.h"
++#include "bonsai_p40.h"
++
++#include <cuda_runtime.h>
++
++using namespace bonsai;
++
++namespace {
++
++constexpr int GEMV_WARPS_PER_BLOCK = 8;   // 256 threads
++constexpr int GEMV_ROWS_PER_WARP   = 4;   // weight streams + activation reuse
++constexpr int GEMV_ROWS_PER_BLOCK  = GEMV_WARPS_PER_BLOCK * GEMV_ROWS_PER_WARP;
++
++// __launch_bounds__(256, 4): 32 warps/SM and 64 registers/thread, so the
++// four-row body (4 pointers, 4 scales, 4 accumulators, 8 activation words,
++// 8 code words) stays in registers without spilling.
++__global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, 4)
++gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
++                      const block_q8_1  * __restrict__ X,
++                      float * __restrict__ Y,
++                      const int n_out, const int nblocks) {
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int row0 = (blockIdx.x * GEMV_WARPS_PER_BLOCK + warp) * GEMV_ROWS_PER_WARP;
++    if (row0 >= n_out) return;
++
++    // Rows past the end are clamped (computed but never stored) so the loop
++    // body stays branch-free.
++    const int last = n_out - 1;
++    const block_pq2_0 * wr[GEMV_ROWS_PER_WARP];
++#pragma unroll
++    for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
++        wr[r] = W + (size_t)min(row0 + r, last) * (size_t)nblocks;
++
++    float acc[GEMV_ROWS_PER_WARP];
++#pragma unroll
++    for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) acc[r] = 0.0f;
++
++    for (int b = lane; b < nblocks; b += 32) {
++        const block_q8_1 * ab = X + (size_t)b * BONSAI_QI_PQ2_0;
++
++        // Keep the weight stream ahead of the dp4a consumers.  All four rows
++        // are prefetched (each is a separate stream), clamped to the row so the
++        // hint can never point outside the weight buffer.  The activation side
++        // lives in L2 already (a few KB) and needs no help.
++        const int pf = min(b + 32, nblocks - 1);
++#pragma unroll
++        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) p40_prefetch_l2(wr[r] + pf);
++
++        float dw[GEMV_ROWS_PER_WARP];
++#pragma unroll
++        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
++            dw[r] = f16_to_f32(p40_ldg_u16(&wr[r][b].d));
++
++#pragma unroll
++        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) {
++            // Activations: 32 bytes at 4-byte alignment -> eight int32 loads.
++            const int * ap = (const int *)ab[iqs].qs;
++            const int a0 = ap[0], a1 = ap[1], a2 = ap[2], a3 = ap[3];
++            const int a4 = ap[4], a5 = ap[5], a6 = ap[6], a7 = ap[7];
++            const int bias = -q8_1_sum(&ab[iqs]);   // value = code - 1
++            const float da = f16_to_f32(ab[iqs].d);
++
++            int s[GEMV_ROWS_PER_WARP];
++#pragma unroll
++            for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) s[r] = bias;
++
++#pragma unroll
++            for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) {
++                const uint16_t * qp = (const uint16_t *)(wr[r][b].qs + iqs * 8);
++                const uint32_t w0 = p40_ldg_u16x2(qp + 0);
++                const uint32_t w1 = p40_ldg_u16x2(qp + 2);
++                s[r] = p40_dp4a_us((w0 >> 0) & 0x03030303u, a0, s[r]);
++                s[r] = p40_dp4a_us((w0 >> 2) & 0x03030303u, a1, s[r]);
++                s[r] = p40_dp4a_us((w0 >> 4) & 0x03030303u, a2, s[r]);
++                s[r] = p40_dp4a_us((w0 >> 6) & 0x03030303u, a3, s[r]);
++                s[r] = p40_dp4a_us((w1 >> 0) & 0x03030303u, a4, s[r]);
++                s[r] = p40_dp4a_us((w1 >> 2) & 0x03030303u, a5, s[r]);
++                s[r] = p40_dp4a_us((w1 >> 4) & 0x03030303u, a6, s[r]);
++                s[r] = p40_dp4a_us((w1 >> 6) & 0x03030303u, a7, s[r]);
++            }
++
++#pragma unroll
++            for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
++                acc[r] += dw[r] * da * (float)s[r];
++        }
++    }
++
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++#pragma unroll
++        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
++            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], o);
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
++            if (row0 + r < n_out) Y[row0 + r] = acc[r];
++    }
++}
++
++// One warp per 32-element chunk: amax, quantise, and store transposed.
++__global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, 8)
++quant_q8_1_pq2_kernel(const float * __restrict__ x, block_q8_1 * __restrict__ y,
++                      const int nchunk) {
++    const int lane = threadIdx.x & 31;
++    const int warp = blockIdx.x * GEMV_WARPS_PER_BLOCK + (threadIdx.x >> 5);
++    const int nwarp = gridDim.x * GEMV_WARPS_PER_BLOCK;
++
++    for (int c = warp; c < nchunk; c += nwarp) {
++        const float v = x[c * BONSAI_QK8_1 + lane];
++
++        float amax = fabsf(v);
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++        const float d  = amax / 127.0f;
++        const float id = d > 0.0f ? 1.0f / d : 0.0f;
++
++        int q = __float2int_rn(v * id);
++        q = max(-127, min(127, q));
++        int sum = q;
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
++
++        y[c].d = f32_to_f16(d);
++        y[c].s = (uint16_t)(int16_t)sum;   // raw int16 activation sum
++        // Transposed 4x4 store inside each 16-element half: element `lane`
++        // goes to position 16*(lane>>4) + 4*(lane&3) + ((lane>>2)&3).
++        y[c].qs[16 * (lane >> 4) + 4 * (lane & 3) + ((lane >> 2) & 3)] = (int8_t)q;
++    }
++}
++
++} // namespace
++
++int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_stream stream) {
++    if (n <= 0 || n % BONSAI_QK8_1 != 0) return 1;
++    const int nchunk = (int)(n / BONSAI_QK8_1);
++    const int warps  = (nchunk + 3) / 4;                 // ~4 chunks per warp
++    const int blocks = (warps + GEMV_WARPS_PER_BLOCK - 1) / GEMV_WARPS_PER_BLOCK;
++    quant_q8_1_pq2_kernel<<<blocks, GEMV_WARPS_PER_BLOCK * 32, 0, (cudaStream_t)stream>>>(
++        x, (block_q8_1 *)out, nchunk);
++    return (int)cudaGetLastError();
++}
++
++int bonsai_p40_gemv(const void * W, const void * xq, float * y,
++                    int64_t n_out, int64_t n_in, bonsai_stream stream) {
++    if (n_in <= 0 || n_in % BONSAI_QK_PQ2_0 != 0) return 1;
++    if (n_out <= 0) return 0;
++    const int nblocks = (int)(n_in / BONSAI_QK_PQ2_0);
++    const int blocks  = (int)((n_out + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
++    gemv_pq2_0_p40_kernel<<<blocks, GEMV_WARPS_PER_BLOCK * 32, 0, (cudaStream_t)stream>>>(
++        (const block_pq2_0 *)W, (const block_q8_1 *)xq, y, (int)n_out, nblocks);
++    return (int)cudaGetLastError();
++}
+\ No newline at end of file
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/p40_common.h b/ggml/src/ggml-cuda/bonsai-p40/p40_common.h
+new file mode 100644
+index 0000000..2986467
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/p40_common.h
+@@ -0,0 +1,148 @@
++// p40_common.h -- shared host/device primitives for the Bonsai-P40 kernel.
++//
++// Everything in this header is compiled both by nvcc (device) and by a plain
++// C++ host compiler (reference + tests).  The numeric core of every kernel is
++// expressed as a BONSAI_HD inline function so the exact same code path that the
++// P40 runs can be validated on the host against a naive dequantised reference.
++//
++// Target: NVIDIA Tesla P40 (GP102, sm_61, 24 GB GDDR5, ~346 GB/s, no tensor
++// cores, FP16 ALU throughput = 1/64 of FP32 -> we never do FP16 math, we use
++// FP32 accumulate + INT8 DP4A, which sm_61 supports).
++#pragma once
++
++#include <cstdint>
++#include <cmath>
++#include <cstring>
++
++#ifdef __CUDACC__
++#define BONSAI_HD __host__ __device__
++#define BONSAI_D  __device__
++#define BONSAI_H  __host__
++#include <cuda_runtime.h>
++#include <cuda_fp16.h>
++#else
++#define BONSAI_HD
++#define BONSAI_D
++#define BONSAI_H
++#endif
++
++namespace bonsai {
++
++// ---------------------------------------------------------------------------
++// Tesla P40 (GP102) constants.  All tuning decisions in this kernel are made
++// against these numbers and nothing else -- the kernel deliberately does not
++// carry generic code paths for other GPUs.
++// ---------------------------------------------------------------------------
++struct p40_spec {
++    static constexpr int    cc                = 61;      // sm_61
++    static constexpr int    sm_count          = 30;      // GP102: 30 SMs
++    static constexpr int    cores_per_sm      = 128;
++    static constexpr int    cores             = 3840;
++    static constexpr int    clock_khz         = 1531000; // boost
++    static constexpr int    threads_per_sm    = 2048;
++    static constexpr int    regs_per_sm       = 65536;
++    static constexpr int    smem_per_sm       = 98304;   // 96 KiB
++    static constexpr int    smem_per_block    = 49152;   // 48 KiB (opt-in)
++    static constexpr int    max_blocks_per_sm = 32;
++    static constexpr int    l2_bytes          = 3u * 1024u * 1024u; // 3 MiB
++    static constexpr double mem_bw_gbs        = 346.0;   // GDDR5 peak
++    static constexpr double fp32_tflops       = 2.0 * cores * clock_khz * 1e3 / 1e12;
++    static constexpr int    has_dp4a          = 1;       // cc >= 610
++};
++
++// ---------------------------------------------------------------------------
++// fp16 <-> fp32.  On device we use the hardware intrinsics; on the host we use
++// a bit-exact software conversion so tests reproduce device rounding.
++// ---------------------------------------------------------------------------
++BONSAI_HD inline float f16_to_f32(uint16_t h) {
++#ifdef __CUDACC__
++    return __half2float(__ushort_as_half(h));
++#else
++    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
++    uint32_t exp  = (h >> 10) & 0x1Fu;
++    uint32_t mant =  h & 0x3FFu;
++    uint32_t out;
++    if (exp == 0) {
++        if (mant == 0) { out = sign; }
++        else {                       // subnormal
++            exp = 127 - 15 + 1;
++            while ((mant & 0x400u) == 0) { mant <<= 1; exp--; }
++            mant &= 0x3FFu;
++            out = sign | (exp << 23) | (mant << 13);
++        }
++    } else if (exp == 0x1Fu) {       // inf / nan
++        out = sign | 0x7F800000u | (mant << 13);
++    } else {
++        out = sign | ((exp - 15 + 127) << 23) | (mant << 13);
++    }
++    float f; std::memcpy(&f, &out, sizeof(f)); return f;
++#endif
++}
++
++BONSAI_HD inline uint16_t f32_to_f16(float f) {
++#ifdef __CUDACC__
++    return __half_as_ushort(__float2half(f));
++#else
++    // Host reference conversion.  NOTE: this rounds half-away-from-zero while
++    // the hardware cvt.rn.f16.f32 rounds to nearest-even.  The two differ only
++    // on exact ties, and the decoded values here are PQ2_0 group scales whose
++    // contribution is far below the quantisation noise the tests measure; the
++    // host/device comparison is therefore within tolerance by construction.
++    uint32_t x; std::memcpy(&x, &f, sizeof(x));
++    const uint32_t sign = (x >> 16) & 0x8000u;
++    int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;
++    uint32_t mant = x & 0x7FFFFFu;
++    if (((x >> 23) & 0xFFu) == 0xFFu) {                 // inf / nan
++        return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u));
++    }
++    if (exp >= 0x1F) { return (uint16_t)(sign | 0x7C00u); }        // overflow
++    if (exp <= 0) {                                     // subnormal / zero
++        if (exp < -10) { return (uint16_t)sign; }
++        mant |= 0x800000u;
++        const uint32_t shift = (uint32_t)(14 - exp);
++        uint32_t m = mant >> shift;
++        if (mant & (1u << (shift - 1))) { m += 1; }     // round half up
++        return (uint16_t)(sign | m);
++    }
++    uint32_t m = mant >> 13;
++    if (mant & 0x1000u) {                               // round half up
++        m += 1;
++        if (m == 0x400u) { m = 0; exp += 1; if (exp >= 0x1F) { return (uint16_t)(sign | 0x7C00u); } }
++    }
++    return (uint16_t)(sign | ((uint32_t)exp << 10) | m);
++#endif
++}
++
++// A "half" stored as raw bits, used to lay out the GGUF blocks on the host.
++struct hbits { uint16_t v; };
++
++BONSAI_HD inline int dp4a(int a, int b, int c) {
++#ifdef __CUDACC__
++#if __CUDA_ARCH__ >= 610
++    return __dp4a(a, b, c);
++#else
++    int r = c;
++    for (int i = 0; i < 4; ++i) {
++        const int ai = (a >> (8 * i)) & 0xFF; const int bi = (b >> (8 * i)) & 0xFF;
++        r += (int8_t)ai * (int8_t)bi;
++    }
++    return r;
++#endif
++#else
++    // Host emulation of __dp4a: four signed byte products.
++    int r = c;
++    for (int i = 0; i < 4; ++i) {
++        const int8_t ai = (int8_t)((a >> (8 * i)) & 0xFF);
++        const int8_t bi = (int8_t)((b >> (8 * i)) & 0xFF);
++        r += (int)ai * (int)bi;
++    }
++    return r;
++#endif
++}
++
++// Sum of the four signed bytes of a packed int (used to fold the PQ2_0 +1 bias).
++BONSAI_HD inline int dp4a_sum(int a) {
++    return dp4a(a, 0x01010101, 0);
++}
++
++} // namespace bonsai
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/p40_dispatch_predicate.h b/ggml/src/ggml-cuda/bonsai-p40/p40_dispatch_predicate.h
+new file mode 100644
+index 0000000..435dfbb
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/p40_dispatch_predicate.h
+@@ -0,0 +1,49 @@
++// p40_dispatch_predicate.h -- the ONLY decision that lets the P40 kernel take
++// over a MUL_MAT, kept free of ggml and CUDA types so it can be unit-tested.
++//
++// This is the safety-critical part of the PrismML integration: if it says yes
++// for a shape the kernel does not implement, results are silently wrong; if it
++// says no, ggml just falls through to the stock path.  Hence: pure C++,
++// exhaustively tested (see tests/test_p40.cpp, section 11).
++#pragma once
++
++#include <cstdint>
++
++namespace bonsai {
++
++// Numeric values of the ggml_type enum we care about (ggml.h; stable ABI).
++static constexpr int P40_GGML_TYPE_F32   = 0;
++static constexpr int P40_GGML_TYPE_PQ2_0 = 142;
++
++// Geometry the kernel actually supports.
++static constexpr int P40_QK_PQ2_0        = 128;   // weights per PQ2_0 block
++static constexpr int P40_BLOCK_PQ2_0_BYTES = 34;  // fp16 d + 32 code bytes
++static constexpr int P40_MAX_ROW         = 32768; // widest row we allocate scratch for
++
++// Everything the predicate needs, as plain numbers.
++struct p40_mulmat_shape {
++    int     type0, type1, type2;   // src0, src1, dst ggml types
++    int64_t n_in, n_out;           // src0->ne[0], src0->ne[1]
++    int64_t ne20, ne30;            // src0->ne[2], src0->ne[3]
++    int64_t ne11, ne12, ne13;      // src1->ne[1..3]
++    int64_t dst_ne1;               // dst->ne[1]
++    int64_t nb1;                   // src0->nb[1] (row stride in bytes)
++};
++
++inline bool p40_decode_path_ok(const p40_mulmat_shape & s) {
++    if (s.type0 != P40_GGML_TYPE_PQ2_0) return false;
++    if (s.type1 != P40_GGML_TYPE_F32 || s.type2 != P40_GGML_TYPE_F32) return false;
++    // plain 2D MUL_MAT, one output column (decode)
++    if (s.ne20 != 1 || s.ne30 != 1) return false;
++    if (s.ne11 != 1 || s.ne12 != 1 || s.ne13 != 1) return false;
++    if (s.dst_ne1 != 1) return false;
++    // dimensions the kernel handles
++    if (s.n_in <= 0 || s.n_out <= 0) return false;
++    if (s.n_in % P40_QK_PQ2_0 != 0) return false;
++    if (s.n_in > P40_MAX_ROW) return false;
++    // rows must be a contiguous run of PQ2_0 blocks
++    if (s.nb1 != (s.n_in / P40_QK_PQ2_0) * P40_BLOCK_PQ2_0_BYTES) return false;
++    return true;
++}
++
++} // namespace bonsai
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/p40_ptx.h b/ggml/src/ggml-cuda/bonsai-p40/p40_ptx.h
+new file mode 100644
+index 0000000..e675452
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/p40_ptx.h
+@@ -0,0 +1,71 @@
++// p40_ptx.h -- the few places where hand-written PTX beats what nvcc emits for
++// the P40, plus the reasoning for what is deliberately NOT done in PTX.
++//
++// WHY THIS FILE IS SMALL
++// ----------------------
++// The decode kernel is bandwidth-bound: 7.2 GB per token / 346 GB/s = 20.8 ms,
++// while the entire token costs only ~0.45 G warp-instructions, i.e. ~1-2 ms of
++// issue on 30 SMs x 4 schedulers.  Instruction count therefore does not set the
++// tok/s number, so replacing arithmetic with PTX buys nothing.  What DOES
++// matter is the memory path (cache policy, load width, request coalescing) and
++// occupancy (register pressure -> warps in flight -> latency hiding).
++//
++// So only three things are hand-written:
++//   1. read-only loads (ld.global.nc) for the weights and activations, which
++//      are strictly read-only for the kernel's lifetime;
++//   2. an explicit dp4a.u32.s32, because the weight operand is an *unsigned*
++//      byte (0..3) while the activation operand is signed -- nvcc has to guess,
++//      and stating it removes any sign-extension ambiguity;
++//   3. an L2 prefetch to keep the weight stream ahead of the consumers.
++//
++// Everything else (cvt.f32.f16 for the scales, shfl.sync reductions, the
++// dp4a-based code extraction) is already emitted optimally by nvcc, and adding
++// PTX for it would only add risk.
++#pragma once
++
++#include "p40_common.h"
++
++namespace bonsai {
++
++// --- 1. read-only 16-bit load through the non-coherent (texture) path -------
++// Used for the PQ2_0 code words and the fp16 scales.  The pointers are 2-byte
++// aligned by construction (block_pq2_0 is a 34-byte struct), so we must never
++// widen this to a 32-bit load.
++BONSAI_HD inline uint16_t p40_ldg_u16(const uint16_t * p) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 320
++    uint16_t v;
++    asm("ld.global.nc.u16 %0, [%1];" : "=h"(v) : "l"(p));
++    return v;
++#else
++    return *p;
++#endif
++}
++
++// Two adjacent uint16 (one 16-code word) as a uint32.
++BONSAI_HD inline uint32_t p40_ldg_u16x2(const uint16_t * p) {
++    return (uint32_t)p40_ldg_u16(p) | ((uint32_t)p40_ldg_u16(p + 1) << 16);
++}
++
++// --- 2. explicit mixed-signedness dp4a -------------------------------------
++// `w` holds four unsigned 2-bit codes (0..3); `a` holds four signed int8
++// activations.  dp4a.u32.s32 states exactly that.
++BONSAI_HD inline int p40_dp4a_us(uint32_t w, int a, int c) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
++    int r;
++    asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(w), "r"(a), "r"(c));
++    return r;
++#else
++    return dp4a((int)w, a, c);   // host reference / pre-sm61 fallback
++#endif
++}
++
++// --- 3. L2 prefetch for the streaming weight reads -------------------------
++BONSAI_HD inline void p40_prefetch_l2(const void * p) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 200
++    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
++#else
++    (void)p;
++#endif
++}
++
++} // namespace bonsai
+\ No newline at end of file
+diff --git a/ggml/src/ggml-cuda/bonsai-p40/pq2_0.h b/ggml/src/ggml-cuda/bonsai-p40/pq2_0.h
+new file mode 100644
+index 0000000..a9ee82c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/bonsai-p40/pq2_0.h
+@@ -0,0 +1,193 @@
++// pq2_0.h -- the "q2_0" weight format of Ternary-Bonsai-2-27B and its numeric
++// core, shared verbatim between the host reference/tests and the P40 kernels.
++//
++// The shipped GGUF file is the PQ2_0 packing (GGML_TYPE_PQ2_0 = 142):
++//
++//   block_pq2_0 : 128 weights, 2-bit codes, one fp16 scale per 128.
++//   code c in {0,1,2,3}  ->  value = (c - 1) * d   (dequantize_row_pq2_0)
++//   element j lives in byte j/4, bits (j%4)*2, little endian.
++//
++// The checkpoint is ternary, so only codes {0,1,2} actually occur; the kernel
++// still handles code 3 because the format (and the reference quantiser) can
++// produce it and the dequantiser maps it to +2.
++//
++// Group size 128, so block size = 2 (fp16 d) + 32 (codes) = 34 bytes.
++#pragma once
++
++#include "p40_common.h"
++
++namespace bonsai {
++
++// ---------------------------------------------------------------------------
++// Block geometry.
++//
++// These are BONSAI_-prefixed ON PURPOSE.  The PrismML fork's ggml-common.h
++// #defines QK_PQ2_0 / QK8_1 / QK8_0 as macros, so a plain `QK8_1` here would be
++// textually replaced and turn `static constexpr int QK8_1 = 32;` into
++// `static constexpr int 32 = 32;`.  Where the fork is present we *inherit* its
++// values instead of duplicating them, so they cannot drift apart.
++// (checked by tools/check_macro_collisions.py)
++// ---------------------------------------------------------------------------
++#ifdef QK_PQ2_0
++static constexpr int BONSAI_QK_PQ2_0 = QK_PQ2_0;     // inherit ggml's value
++#else
++static constexpr int BONSAI_QK_PQ2_0 = 128;          // weights per block
++#endif
++
++#ifdef QK8_1
++static constexpr int BONSAI_QK8_1 = QK8_1;           // inherit ggml's value
++#else
++static constexpr int BONSAI_QK8_1 = 32;              // elements per q8_1 block
++#endif
++
++static constexpr int BONSAI_QI_PQ2_0 = BONSAI_QK_PQ2_0 / 32;   // 4 code chunks per block
++
++struct block_pq2_0 {                             // 34 bytes, 2-byte aligned
++    uint16_t d;                                  // fp16 group scale
++    uint8_t  qs[BONSAI_QK_PQ2_0 / 4];                   // 32 bytes = 128 * 2 bit
++};
++
++struct block_q8_1 {                              // 36 bytes
++    uint16_t d;                                  // fp16 scale
++    uint16_t s;                                  // fp16 bits holding int16 sum(q)
++    int8_t   qs[BONSAI_QK8_1];
++};
++
++BONSAI_HD inline float pq2_0_value(const block_pq2_0 * b, int j) {
++    const int code = (b->qs[j >> 2] >> ((j & 3) * 2)) & 0x03;
++    return (float)(code - 1) * f16_to_f32(b->d);
++}
++
++// Reference dequantiser -- mirrors dequantize_row_pq2_0() in the PrismML fork.
++inline void dequantize_row_pq2_0(const block_pq2_0 * x, float * y, int64_t k) {
++    const int64_t nb = k / BONSAI_QK_PQ2_0;
++    for (int64_t i = 0; i < nb; ++i) {
++        const float d = f16_to_f32(x[i].d);
++        for (int j = 0; j < BONSAI_QK_PQ2_0; ++j) {
++            const int code = (x[i].qs[j >> 2] >> ((j & 3) * 2)) & 0x03;
++            y[i * BONSAI_QK_PQ2_0 + j] = (float)(code - 1) * d;
++        }
++    }
++}
++
++// Reference quantiser -- mirrors quantize_row_pq2_0_ref().
++inline void quantize_row_pq2_0(const float * x, block_pq2_0 * y, int64_t k) {
++    const int64_t nb = k / BONSAI_QK_PQ2_0;
++    for (int64_t i = 0; i < nb; ++i) {
++        float amax = 0.0f;
++        for (int j = 0; j < BONSAI_QK_PQ2_0; ++j) amax = fmaxf(amax, fabsf(x[i * BONSAI_QK_PQ2_0 + j]));
++        const float d  = amax;
++        const float id = d > 0.0f ? 1.0f / d : 0.0f;
++        y[i].d = f32_to_f16(d);
++        for (int j = 0; j < BONSAI_QK_PQ2_0 / 4; ++j) y[i].qs[j] = 0;
++        for (int j = 0; j < BONSAI_QK_PQ2_0; ++j) {
++            int q = (int)lroundf(x[i * BONSAI_QK_PQ2_0 + j] * id) + 1;
++            if (q < 0) { q = 0; }
++            if (q > 3) { q = 3; }
++            y[i].qs[j >> 2] |= (uint8_t)(q << ((j & 3) * 2));
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Activation quantiser.  `permute = false` gives the plain Q8_1 layout;
++// `permute = true` gives the PQ2_0-native layout used by the device kernels:
++// inside every 32-element chunk the four int32 words are transposed so that
++// word k holds elements {k, k+4, k+8, k+12}.  This lets the kernel pair the
++// extracted 2-bit codes with activation bytes without any per-weight shuffle.
++// ---------------------------------------------------------------------------
++inline void quantize_row_q8_1(const float * x, block_q8_1 * y, int64_t k, bool permute) {
++    const int64_t nb = k / BONSAI_QK8_1;
++    for (int64_t i = 0; i < nb; ++i) {
++        float amax = 0.0f;
++        for (int j = 0; j < BONSAI_QK8_1; ++j) amax = fmaxf(amax, fabsf(x[i * BONSAI_QK8_1 + j]));
++        const float d  = amax / 127.0f;
++        const float id = d > 0.0f ? 1.0f / d : 0.0f;
++        int sum = 0;
++        int8_t q[BONSAI_QK8_1];
++        for (int j = 0; j < BONSAI_QK8_1; ++j) {
++            int v = (int)lroundf(x[i * BONSAI_QK8_1 + j] * id);
++            if (v < -127) { v = -127; }
++            if (v > 127)  { v = 127; }
++            q[j] = (int8_t)v; sum += v;
++        }
++        y[i].d = f32_to_f16(d);
++        // `s` carries the raw int16 activation sum in its bit pattern (the
++        // PQ2_0 kernels read it back as int16, never as a float).
++        y[i].s = (uint16_t)(int16_t)sum;
++        // Transposed 4x4 layout inside each 16-element half: position j holds
++        // element 16*(j>>4) + 4*(j&3) + ((j>>2)&3), so the kernel's extracted
++        // 2-bit code word k lines up byte-for-byte with activation word k.
++        for (int j = 0; j < BONSAI_QK8_1; ++j) {
++            const int src = 16 * (j >> 4) + 4 * (j & 3) + ((j >> 2) & 3);
++            y[i].qs[j] = q[permute ? src : j];
++        }
++    }
++}
++
++BONSAI_HD inline int q8_1_sum(const block_q8_1 * a) { return (int16_t)a->s; }
++
++// ---------------------------------------------------------------------------
++// Naive float dot of one PQ2_0 block against 128 float activations.  This is
++// the definition every kernel must reproduce.
++// ---------------------------------------------------------------------------
++inline float pq2_0_dot_f32(const block_pq2_0 * w, const float * a) {
++    const float d = f16_to_f32(w->d);
++    float acc = 0.0f;
++    for (int j = 0; j < BONSAI_QK_PQ2_0; ++j) {
++        const int code = (w->qs[j >> 2] >> ((j & 3) * 2)) & 0x03;
++        acc += (float)(code - 1) * a[j];
++    }
++    return acc * d;
++}
++
++// ---------------------------------------------------------------------------
++// Integer DP4A dot of one PQ2_0 block against the single Q8_1 activation block
++// that covers chunk `iqs` (32 activations).  This is the exact inner body of
++// both device kernels: the GEMV passes agroup[iqs], the GEMM passes the staged
++// shared-memory block directly.
++BONSAI_HD inline float pq2_0_dot_q8_1_block(const block_pq2_0 * w,
++                                            const block_q8_1 * a,
++                                            int iqs) {
++    const uint8_t * qs = w->qs + iqs * 8;     // 8 code bytes = 32 elements
++    const int8_t  * as = a->qs;               // 32 activations
++    int sumi = 0;
++    for (int word = 0; word < 2; ++word) {
++        uint32_t wv; std::memcpy(&wv, qs + word * 4, 4);
++        int av[4]; std::memcpy(av, as + word * 16, 16);
++        // t[k] holds codes {k, k+4, k+8, k+12} of this 16-code word as bytes.
++        const int t0 = (int)((wv >> 0) & 0x03030303u);
++        const int t1 = (int)((wv >> 2) & 0x03030303u);
++        const int t2 = (int)((wv >> 4) & 0x03030303u);
++        const int t3 = (int)((wv >> 6) & 0x03030303u);
++        sumi = dp4a(t0, av[0], sumi);
++        sumi = dp4a(t1, av[1], sumi);
++        sumi = dp4a(t2, av[2], sumi);
++        sumi = dp4a(t3, av[3], sumi);
++    }
++    // value = code - 1  =>  sum((c-1)*a) = sum(c*a) - sum(a)
++    sumi -= q8_1_sum(a);
++    const float d = f16_to_f32(w->d) * f16_to_f32(a->d);
++    return d * (float)sumi;
++}
++
++// Group form: `agroup` points at the four contiguous activation blocks of one
++// weight block (the GEMV layout, one token).
++BONSAI_HD inline float pq2_0_dot_q8_1_perm(const block_pq2_0 * w,
++                                           const block_q8_1 * agroup,
++                                           int iqs) {
++    return pq2_0_dot_q8_1_block(w, agroup + iqs, iqs);
++}
++
++// Whole-row dot: `n` must be a multiple of BONSAI_QK_PQ2_0.
++inline float pq2_0_row_dot_perm(const block_pq2_0 * w, const block_q8_1 * a, int n) {
++    float acc = 0.0f;
++    for (int i = 0; i < n / BONSAI_QK_PQ2_0; ++i) {
++        const block_pq2_0 * wb = w + i;
++        const block_q8_1  * ab = a + i * BONSAI_QI_PQ2_0;
++        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) acc += pq2_0_dot_q8_1_perm(wb, ab, iqs);
++    }
++    return acc;
++}
++
++} // namespace bonsai
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 616f1d7..c804bff 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -32,6 +32,7 @@
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cuh"
+ #include "ggml-cuda/moe-reduce.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -1864,6 +1865,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    if (bonsai_p40_should_use(src0->type, cc, ne11) &&
++            bonsai_p40_mul_mat(src0, src1, dst, ctx.stream())) {
++        return;
++    }
+     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;

@@ -61,7 +61,7 @@ kv_quantize_append_kernel(block_q8_0 * __restrict__ K, block_q8_0 * __restrict__
     const int blk = kv_blk_of_lane(lane);      // 0..7
     const int sub = kv_sub_of_lane(lane);
 
-    const int64_t bidx = (((int64_t)layer * n_kv_head + h) * capacity + pos) * (head_dim / QK8_0) + blk;
+    const int64_t bidx = (((int64_t)layer * n_kv_head + h) * capacity + pos) * (head_dim / BONSAI_QK8_0) + blk;
     const float * kr = ksrc + ((int64_t)row * head_dim);
     const float * vr = vsrc + ((int64_t)row * head_dim);
 
@@ -125,7 +125,7 @@ kv_quantize_q_kernel(const float * __restrict__ q, block_q8_0 * __restrict__ q8,
 
     const float d  = amax / 127.0f;
     const float id = d > 0.0f ? 1.0f / d : 0.0f;
-    if (sub == 0) q8[(int64_t)head * (head_dim / QK8_0) + blk].d = f32_to_f16(d);
+    if (sub == 0) q8[(int64_t)head * (head_dim / BONSAI_QK8_0) + blk].d = f32_to_f16(d);
 
     int8_t qq[4];
 #pragma unroll
@@ -135,7 +135,7 @@ kv_quantize_q_kernel(const float * __restrict__ q, block_q8_0 * __restrict__ q8,
     }
     int32_t qw;
     std::memcpy(&qw, qq, 4);
-    std::memcpy(q8[(int64_t)head * (head_dim / QK8_0) + blk].qs + sub * 4, &qw, 4);
+    std::memcpy(q8[(int64_t)head * (head_dim / BONSAI_QK8_0) + blk].qs + sub * 4, &qw, 4);
 }
 
 // --- decode: one split of the flash pass -----------------------------------
@@ -155,7 +155,7 @@ kv_attn_split_kernel(const block_q8_0 * __restrict__ q8,
     const int blk   = kv_blk_of_lane(lane);
     const int sub   = kv_sub_of_lane(lane);
     const int d0    = blk * 32 + sub * 4;
-    const int nblk  = head_dim / QK8_0;
+    const int nblk  = head_dim / BONSAI_QK8_0;
 
     // query word + scale, constant over the whole split
     const block_q8_0 * qb = q8 + (int64_t)head * nblk + blk;
@@ -273,7 +273,7 @@ bonsai_kv_cache * bonsai_kv_create(int capacity, bonsai_stream stream) {
     const int64_t wbytes = (int64_t)model_27b::n_head * kv->n_split *
                            (kv->geo.head_dim + 2) * sizeof(float);
     const int64_t qbytes = (int64_t)model_27b::n_head *
-                           (kv->geo.head_dim / QK8_0) * sizeof(block_q8_0);
+                           (kv->geo.head_dim / BONSAI_QK8_0) * sizeof(block_q8_0);
 
     if (cudaMalloc(&kv->d_k, kbytes) != cudaSuccess) { std::free(kv); return nullptr; }
     if (cudaMalloc(&kv->d_v, kbytes) != cudaSuccess) {

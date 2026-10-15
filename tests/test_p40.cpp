@@ -7,6 +7,7 @@
 #include "../src/pq2_0.h"
 #include "../src/p40_ptx.h"
 #include "../src/kv_cache.h"
+#include "../src/p40_dispatch_predicate.h"
 #include "../src/fwht.h"
 #include "../src/ops.h"
 #include "../include/bonsai_model.h"
@@ -45,7 +46,7 @@ static void test_pq2_0_format() {
     std::vector<float> w(n);
     for (int i = 0; i < n; ++i) w[i] = std::round(ud(rng) * 1.2f);  // {-1,0,+1}
 
-    std::vector<block_pq2_0> wq(n / QK_PQ2_0);
+    std::vector<block_pq2_0> wq(n / BONSAI_QK_PQ2_0);
     quantize_row_pq2_0(w.data(), wq.data(), n);
 
     std::vector<float> wd(n);
@@ -57,7 +58,7 @@ static void test_pq2_0_format() {
     std::vector<float> x(n);
     for (int i = 0; i < n; ++i) x[i] = ud(rng) * 3.0f;
 
-    std::vector<block_q8_1> a_perm(n / QK8_1), a_plain(n / QK8_1);
+    std::vector<block_q8_1> a_perm(n / BONSAI_QK8_1), a_plain(n / BONSAI_QK8_1);
     quantize_row_q8_1(x.data(), a_perm.data(), n, true);
     quantize_row_q8_1(x.data(), a_plain.data(), n, false);
 
@@ -66,10 +67,10 @@ static void test_pq2_0_format() {
 
     // exact integer reference over the plain layout
     double ref_exact = 0.0;
-    for (int b = 0; b < n / QK_PQ2_0; ++b) {
+    for (int b = 0; b < n / BONSAI_QK_PQ2_0; ++b) {
         const double dw = f16_to_f32(wq[b].d);
-        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
-            const block_q8_1 & ab = a_plain[b * QI_PQ2_0 + iqs];
+        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) {
+            const block_q8_1 & ab = a_plain[b * BONSAI_QI_PQ2_0 + iqs];
             const double da = f16_to_f32(ab.d);
             int64_t s = 0;
             for (int j = 0; j < 32; ++j) {
@@ -84,15 +85,15 @@ static void test_pq2_0_format() {
 
     // and it must be close to the true float dot (quantisation error only)
     float true_dot = 0.0f;
-    for (int b = 0; b < n / QK_PQ2_0; ++b)
-        true_dot += pq2_0_dot_f32(wq.data() + b, x.data() + b * QK_PQ2_0);
+    for (int b = 0; b < n / BONSAI_QK_PQ2_0; ++b)
+        true_dot += pq2_0_dot_f32(wq.data() + b, x.data() + b * BONSAI_QK_PQ2_0);
     CHECK(std::fabs(true_dot - kernel_dot) / (std::fabs(true_dot) + 1e-3f) < 0.05f,
           "quantised dot within 5%% of float dot (%.5f vs %.5f)", kernel_dot, true_dot);
 
     // permuted activations must dequantise to the same vector as the plain ones
     double l1 = 0.0;
-    for (int c = 0; c < n / QK8_1; ++c) {
-        for (int j = 0; j < QK8_1; ++j) {
+    for (int c = 0; c < n / BONSAI_QK8_1; ++c) {
+        for (int j = 0; j < BONSAI_QK8_1; ++j) {
             const int src = 16 * (j >> 4) + 4 * (j & 3) + ((j >> 2) & 3);
             l1 += std::fabs((float)a_perm[c].qs[j] - (float)a_plain[c].qs[src]);
         }
@@ -325,8 +326,8 @@ static void test_geometry() {
 
     const int rows[] = {M::n_embd, M::n_ff, M::q_proj_dim, M::ssm_qkv_dim, M::ssm_inner, M::kv_dim};
     for (int r : rows) {
-        CHECK(r % QK_PQ2_0 == 0, "row length %d is a PQ2_0 multiple", r);
-        CHECK(r % QK8_1 == 0, "row length %d is a Q8_1 multiple", r);
+        CHECK(r % BONSAI_QK_PQ2_0 == 0, "row length %d is a PQ2_0 multiple", r);
+        CHECK(r % BONSAI_QK8_1 == 0, "row length %d is a Q8_1 multiple", r);
     }
 }
 
@@ -344,7 +345,7 @@ static void test_gemv_loop() {
     const int n_in = 5120;
     const int n_out = 5;                       // deliberately not a multiple of 4
     const int WARPS = 8, ROWS_PER_WARP = 4, ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
-    const int nblocks = n_in / QK_PQ2_0;
+    const int nblocks = n_in / BONSAI_QK_PQ2_0;
     const int last = n_out - 1;
 
     std::vector<float> w((size_t)n_out * n_in), x(n_in);
@@ -354,7 +355,7 @@ static void test_gemv_loop() {
     std::vector<block_pq2_0> wq((size_t)n_out * nblocks);
     for (int r = 0; r < n_out; ++r)
         quantize_row_pq2_0(w.data() + (size_t)r * n_in, wq.data() + (size_t)r * nblocks, n_in);
-    std::vector<block_q8_1> xq(n_in / QK8_1);
+    std::vector<block_q8_1> xq(n_in / BONSAI_QK8_1);
     quantize_row_q8_1(x.data(), xq.data(), n_in, true);
 
     const int nblk = (n_out + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
@@ -377,8 +378,8 @@ static void test_gemv_loop() {
                 for (int lane = 0; lane < 32; ++lane) {
                     float acc = 0.0f;
                     for (int b = lane; b < nblocks; b += 32) {
-                        const block_q8_1 * ab = xq.data() + (size_t)b * QI_PQ2_0;
-                        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs)
+                        const block_q8_1 * ab = xq.data() + (size_t)b * BONSAI_QI_PQ2_0;
+                        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs)
                             acc += pq2_0_dot_q8_1_perm(wr[r] + b, ab, iqs);
                     }
                     lane_acc[lane] = acc;
@@ -399,8 +400,8 @@ static void test_gemv_loop() {
     for (int r = 0; r < n_out; ++r) {
         float refd = 0.0f;
         for (int b = 0; b < nblocks; ++b) {
-            const block_q8_1 * ab = xq.data() + (size_t)b * QI_PQ2_0;
-            for (int iqs = 0; iqs < QI_PQ2_0; ++iqs)
+            const block_q8_1 * ab = xq.data() + (size_t)b * BONSAI_QI_PQ2_0;
+            for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs)
                 refd += pq2_0_dot_q8_1_perm(wq.data() + (size_t)r * nblocks + b, ab, iqs);
         }
         check_close(out[r], refd, 1e-2f, "gemv row value");
@@ -424,7 +425,7 @@ static void test_gemm_tiling() {
     std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
 
     const int n_out = 64, n_in = 256, n_tok = 5;
-    const int nblocks = n_in / QK_PQ2_0, nchunk = n_in / QK8_1;
+    const int nblocks = n_in / BONSAI_QK_PQ2_0, nchunk = n_in / BONSAI_QK8_1;
     std::vector<float> w((size_t)n_out * n_in), x((size_t)n_in * n_tok);
     for (auto & v : w) v = std::round(ud(rng) * 1.2f);
     for (auto & v : x) v = ud(rng) * 3.0f;
@@ -437,10 +438,10 @@ static void test_gemm_tiling() {
     std::vector<block_q8_1> X((size_t)nchunk * n_tok);
     for (int c = 0; c < nchunk; ++c)
         for (int t = 0; t < n_tok; ++t) {
-            std::vector<float> one(QK8_1);
-            for (int d = 0; d < QK8_1; ++d) one[d] = x[(size_t)(c * QK8_1 + d) * n_tok + t];
+            std::vector<float> one(BONSAI_QK8_1);
+            for (int d = 0; d < BONSAI_QK8_1; ++d) one[d] = x[(size_t)(c * BONSAI_QK8_1 + d) * n_tok + t];
             std::vector<block_q8_1> tmp(1);
-            quantize_row_q8_1(one.data(), tmp.data(), QK8_1, true);
+            quantize_row_q8_1(one.data(), tmp.data(), BONSAI_QK8_1, true);
             X[(size_t)c * n_tok + t] = tmp[0];
         }
 
@@ -456,10 +457,10 @@ static void test_gemm_tiling() {
                     const block_pq2_0 * wrow = wq.data() + (size_t)row * nblocks;
                     float acc[BN] = {};
                     for (int b = 0; b < nblocks; ++b)
-                        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
+                        for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) {
                             const block_pq2_0 * wb = wrow + b;
                             for (int j = 0; j < ncol; ++j) {
-                                const block_q8_1 * ab = X.data() + (size_t)(b * QI_PQ2_0 + iqs) * n_tok + (c0 + j);
+                                const block_q8_1 * ab = X.data() + (size_t)(b * BONSAI_QI_PQ2_0 + iqs) * n_tok + (c0 + j);
                                 acc[j] += pq2_0_dot_q8_1_block(wb, ab, iqs);
                             }
                         }
@@ -474,8 +475,8 @@ static void test_gemm_tiling() {
         for (int t = 0; t < n_tok; ++t) {
             double ref = 0.0;
             for (int b = 0; b < nblocks; ++b)
-                for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
-                    const block_q8_1 & a = X[(size_t)(b * QI_PQ2_0 + iqs) * n_tok + t];
+                for (int iqs = 0; iqs < BONSAI_QI_PQ2_0; ++iqs) {
+                    const block_q8_1 & a = X[(size_t)(b * BONSAI_QI_PQ2_0 + iqs) * n_tok + t];
                     const double da = f16_to_f32(a.d);
                     for (int j = 0; j < 32; ++j) {
                         const int jj = iqs * 32 + j;
@@ -558,7 +559,7 @@ static void test_kv_cache() {
     // --- append -> read back -> score ---
     std::mt19937 rng(9001);
     std::uniform_real_distribution<float> ud(-2.0f, 2.0f);
-    const int D = 256, nblk = D / QK8_0;
+    const int D = 256, nblk = D / BONSAI_QK8_0;
 
     std::vector<float> kf(D), vf(D), qf(D);
     for (auto & x : kf) x = ud(rng);
@@ -643,6 +644,58 @@ static void test_kv_cache() {
     CHECK(std::exp(-INFINITY - 0.0f) == 0.0f, "empty split weight is exactly zero");
 }
 
+// ---------------------------------------------------------------------------
+// 11. The PrismML dispatch predicate -- the only gate that lets the P40 kernel
+//     take over a MUL_MAT.  A wrong "yes" silently corrupts results, so every
+//     rejection reason is exercised, plus the one real model shape.
+// ---------------------------------------------------------------------------
+static void test_dispatch_predicate() {
+    std::printf("[dispatch] PrismML MUL_MAT takeover predicate\n");
+
+    auto base = [] {
+        p40_mulmat_shape s{};
+        s.type0 = P40_GGML_TYPE_PQ2_0;
+        s.type1 = P40_GGML_TYPE_F32;
+        s.type2 = P40_GGML_TYPE_F32;
+        s.n_in  = 5120;  s.n_out = 17408;
+        s.ne20 = 1; s.ne30 = 1;
+        s.ne11 = 1; s.ne12 = 1; s.ne13 = 1;
+        s.dst_ne1 = 1;
+        s.nb1 = (5120 / P40_QK_PQ2_0) * P40_BLOCK_PQ2_0_BYTES;   // 40*34 = 1360
+        return s;
+    };
+
+    CHECK(p40_decode_path_ok(base()), "accepts the real ffn_up shape (5120 -> 17408)");
+
+    // every PQ2_0 row width in the model must be accepted
+    const int64_t widths[] = {5120, 17408, 6144, 10240, 12288, 1024};
+    for (int64_t w : widths) {
+        p40_mulmat_shape s = base();
+        s.n_in = w;
+        s.nb1  = (w / P40_QK_PQ2_0) * P40_BLOCK_PQ2_0_BYTES;
+        CHECK(p40_decode_path_ok(s), "accepts n_in = %lld", (long long)w);
+    }
+
+    // rejections -- each must fall through to the stock path
+    { p40_mulmat_shape s = base(); s.type0 = 1;  CHECK(!p40_decode_path_ok(s), "reject non-PQ2_0 weights (F16)"); }
+    { p40_mulmat_shape s = base(); s.type0 = 42; CHECK(!p40_decode_path_ok(s), "reject GGML_TYPE_Q2_0 (42) -- different format"); }
+    { p40_mulmat_shape s = base(); s.type1 = 1;  CHECK(!p40_decode_path_ok(s), "reject non-F32 activations"); }
+    { p40_mulmat_shape s = base(); s.type2 = 1;  CHECK(!p40_decode_path_ok(s), "reject non-F32 dst"); }
+    { p40_mulmat_shape s = base(); s.ne20 = 4;   CHECK(!p40_decode_path_ok(s), "reject 3D weights (MUL_MAT_ID/MoE)"); }
+    { p40_mulmat_shape s = base(); s.ne30 = 2;   CHECK(!p40_decode_path_ok(s), "reject 4D weights"); }
+    { p40_mulmat_shape s = base(); s.ne11 = 8;   CHECK(!p40_decode_path_ok(s), "reject batch > 1 (that is the GEMM's job)"); }
+    { p40_mulmat_shape s = base(); s.ne12 = 2;   CHECK(!p40_decode_path_ok(s), "reject src1 ne[2] != 1"); }
+    { p40_mulmat_shape s = base(); s.dst_ne1 = 2; CHECK(!p40_decode_path_ok(s), "reject multi-column dst"); }
+    { p40_mulmat_shape s = base(); s.n_in = 0;   CHECK(!p40_decode_path_ok(s), "reject n_in == 0"); }
+    { p40_mulmat_shape s = base(); s.n_out = 0;  CHECK(!p40_decode_path_ok(s), "reject n_out == 0"); }
+    { p40_mulmat_shape s = base(); s.n_in = 5121; s.nb1 = 40 * P40_BLOCK_PQ2_0_BYTES; CHECK(!p40_decode_path_ok(s), "reject n_in not a multiple of 128"); }
+    { p40_mulmat_shape s = base(); s.n_in = 65536; s.nb1 = (65536 / P40_QK_PQ2_0) * P40_BLOCK_PQ2_0_BYTES; CHECK(!p40_decode_path_ok(s), "reject n_in > scratch size"); }
+    { p40_mulmat_shape s = base(); s.nb1 = 4096; CHECK(!p40_decode_path_ok(s), "reject non-contiguous row stride"); }
+
+    // the scratch must cover the widest real row
+    CHECK(P40_MAX_ROW >= 17408, "scratch covers feed_forward_length = 17408");
+}
+
 int main() {
     test_pq2_0_format();
     test_fwht();
@@ -654,6 +707,7 @@ int main() {
     test_gemm_tiling();
     test_ptx_layer();
     test_kv_cache();
+    test_dispatch_predicate();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
