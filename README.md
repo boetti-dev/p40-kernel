@@ -19,6 +19,7 @@ zugeschnitten.
 | `include/bonsai_model.h` | Exakte Geometrie von qwen35 (aus dem GGUF-Header gelesen) |
 | `include/bonsai_p40.h` | Öffentliche C-API der Kernel |
 | `src/p40_common.h` | Host/Device-Primitive, P40-Konstanten, `dp4a`, fp16↔fp32 |
+| `src/p40_ptx.h` | Handgeschriebene PTX nur dort, wo sie den Speicherpfad/Occupancy betrifft |
 | `src/pq2_0.h` | PQ2_0-Blockformat + `dp4a`-Kern (host **und** device) |
 | `src/fwht.h` | Hadamard-Rotation (Block 1024, normalisiert, Sylvester) |
 | `src/ops.h` | RMSNorm, RoPE, SwiGLU, Gated-DeltaNet-Schritt, Conv1d |
@@ -28,6 +29,7 @@ zugeschnitten.
 | `src/kernels/attn_p40.cu` | Gated DeltaNet + GQA-Flash-Attention |
 | `tests/test_p40.cpp` | Host-Verifikation der gesamten Kernel-Mathematik |
 | `tools/check_gguf.py` | Prüft die Kernel-Konstanten gegen die echte GGUF-Datei |
+| `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |
 | `tools/build_p40.sh` | Build für `sm_61` + Host-Tests |
 
 ## 2. Die Karte: warum hier alles anders ist als bei Ampere/Ada
@@ -80,10 +82,11 @@ $ g++ -O2 -std=c++17 -I src -I include tests/test_p40.cpp -o test_p40 && ./test_
 [gdn] gated delta net step
 [attn] online softmax vs naive
 [model] qwen35 geometry
-[gemv] warp-strided loop
+[gemv] 4-rows-per-warp strided loop
 [gemm] tiled matmul
+[ptx] host fallback path
 
-44 passed, 0 failed
+51 passed, 0 failed
 ```
 
 ```
@@ -122,6 +125,13 @@ nur `GGML_TYPE_PQ2_0` mit der qwen35-Geometrie.
   Umgebung **nicht** gemessen werden — es stand kein `nvcc` und keine GPU zur
   Verfügung. Die Tuning-Entscheidungen sind aus den GP102-Datenblattswerten
   abgeleitet und in `docs/P40_OPTIMIZATION.md` begründet.
+* Die **PTX- und SASS-Ausgabe** wurde ebenfalls nicht kompiliert/verifiziert
+  (kein `nvcc`). `src/p40_ptx.h` benutzt ausschließlich etablierte
+  Instruktionsformen (`ld.global.nc`, `dp4a.u32.s32`, `prefetch.global.L2`),
+  jede hinter `__CUDA_ARCH__`-Guards mit Host-Fallback, der mitgetestet wird.
+  `tools/disasm.sh` ist der vorgesehene Weg, die Behauptungen auf einer
+  Maschine mit Toolkit nachzuprüfen (Registerzahl, `LDG.E.U16`, `DP4A`,
+  `prefetch`).
 * Die Gated-DeltaNet- und Attention-Kernel sind korrekt, aber bewusst einfach
   gehalten: sie sind neben dem 7.2-GB-Gewichtsstream pro Token praktisch
   kostenlos (Zustand ~3 MB), und die volle Attention ist nicht der

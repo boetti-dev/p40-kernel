@@ -120,7 +120,8 @@ __global__ void attn_p40_kernel(const float * __restrict__ q,
 int bonsai_p40_gdn_step(float * state, const float * q, const float * k, const float * v,
                         const float * g, const float * beta, float * out,
                         int n_k_heads, int n_v_heads, int K, int V, bonsai_stream stream) {
-    if (V % GDN_VTILE != 0 || K > 128) return 1;
+    if (V <= 0 || V % GDN_VTILE != 0 || K <= 0 || K > 128) return 1;
+    if (n_v_heads <= 0 || n_k_heads <= 0 || n_v_heads % n_k_heads != 0) return 1;
     const int blocks = n_v_heads * (V / GDN_VTILE);
     gdn_step_p40_kernel<<<blocks, 32, 0, (cudaStream_t)stream>>>(
         state, q, k, v, g, beta, out, n_k_heads, n_v_heads, K, V);
@@ -131,6 +132,7 @@ int bonsai_p40_attn(const float * q, const float * k, const float * v, float * o
                     int n_tok, int n_head, int n_head_kv, int head_dim, float scale,
                     bonsai_stream stream) {
     if (head_dim != 256 || (n_head % n_head_kv) != 0) return 1;
+    if (n_tok <= 0 || n_head <= 0 || n_head_kv <= 0) return (n_tok <= 0) ? 0 : 1;
     const int warps = 8;
     const int blocks = (n_head * n_tok + warps - 1) / warps;
     attn_p40_kernel<<<blocks, warps * 32, 0, (cudaStream_t)stream>>>(

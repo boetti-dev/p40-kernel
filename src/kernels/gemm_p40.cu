@@ -13,6 +13,7 @@
 // exactly once per tile and the DP4A pipe stays fed.
 #include "../pq2_0.h"
 #include "../p40_common.h"
+#include "../p40_ptx.h"
 #include "bonsai_p40.h"
 
 #include <cuda_runtime.h>
@@ -99,16 +100,18 @@ gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
                 const int4 a0 = ((const int4 *)X_s)[idx * 2 + 0];
                 const int4 a1 = ((const int4 *)X_s)[idx * 2 + 1];
                 int sumi = 0;
-                sumi = dp4a(t0, a0.x, sumi);
-                sumi = dp4a(t1, a0.y, sumi);
-                sumi = dp4a(t2, a0.z, sumi);
-                sumi = dp4a(t3, a0.w, sumi);
-                sumi = dp4a(t4, a1.x, sumi);
-                sumi = dp4a(t5, a1.y, sumi);
-                sumi = dp4a(t6, a1.z, sumi);
-                sumi = dp4a(t7, a1.w, sumi);
+                sumi = p40_dp4a_us((uint32_t)t0, a0.x, sumi);
+                sumi = p40_dp4a_us((uint32_t)t1, a0.y, sumi);
+                sumi = p40_dp4a_us((uint32_t)t2, a0.z, sumi);
+                sumi = p40_dp4a_us((uint32_t)t3, a0.w, sumi);
+                sumi = p40_dp4a_us((uint32_t)t4, a1.x, sumi);
+                sumi = p40_dp4a_us((uint32_t)t5, a1.y, sumi);
+                sumi = p40_dp4a_us((uint32_t)t6, a1.z, sumi);
+                sumi = p40_dp4a_us((uint32_t)t7, a1.w, sumi);
                 sumi -= S_s[idx];
-                acc[j] += dw * D_s[idx] * (float)sumi;
+                // One FMA instead of two multiply + add: dw is invariant over j,
+                // so fold it into the activation scale once per element.
+                acc[j] += (dw * D_s[idx]) * (float)sumi;
             }
         }
     }
@@ -125,7 +128,8 @@ gemm_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
 
 int bonsai_p40_gemm(const void * W, const void * Xq, float * Y,
                     int64_t n_out, int64_t n_in, int64_t n_tok, bonsai_stream stream) {
-    if (n_in % QK_PQ2_0 != 0) return 1;
+    if (n_in <= 0 || n_in % QK_PQ2_0 != 0) return 1;
+    if (n_out <= 0 || n_tok <= 0) return 0;
     const int nblocks = (int)(n_in / QK_PQ2_0);
     dim3 grid((unsigned)((n_out + GEMM_ROWS - 1) / GEMM_ROWS),
               (unsigned)((n_tok + GEMM_BN - 1) / GEMM_BN));

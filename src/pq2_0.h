@@ -62,7 +62,8 @@ inline void quantize_row_pq2_0(const float * x, block_pq2_0 * y, int64_t k) {
         for (int j = 0; j < QK_PQ2_0 / 4; ++j) y[i].qs[j] = 0;
         for (int j = 0; j < QK_PQ2_0; ++j) {
             int q = (int)lroundf(x[i * QK_PQ2_0 + j] * id) + 1;
-            if (q < 0) q = 0; if (q > 3) q = 3;
+            if (q < 0) { q = 0; }
+            if (q > 3) { q = 3; }
             y[i].qs[j >> 2] |= (uint8_t)(q << ((j & 3) * 2));
         }
     }
@@ -86,7 +87,8 @@ inline void quantize_row_q8_1(const float * x, block_q8_1 * y, int64_t k, bool p
         int8_t q[QK8_1];
         for (int j = 0; j < QK8_1; ++j) {
             int v = (int)lroundf(x[i * QK8_1 + j] * id);
-            if (v < -127) v = -127; if (v > 127) v = 127;
+            if (v < -127) { v = -127; }
+            if (v > 127)  { v = 127; }
             q[j] = (int8_t)v; sum += v;
         }
         y[i].d = f32_to_f16(d);

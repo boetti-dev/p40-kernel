@@ -69,7 +69,7 @@ __global__ void rmsnorm_p40_kernel(const float * __restrict__ x, const float * _
 } // namespace
 
 int bonsai_p40_fwht(float * x, const float * signs, int64_t n, bonsai_stream stream) {
-    if (n % HADAMARD_BLOCK != 0) return 1;
+    if (n <= 0 || n % HADAMARD_BLOCK != 0) return 1;
     const int blocks = (int)(n / HADAMARD_BLOCK);
     fwht_1024_p40_kernel<<<blocks, 256, 0, (cudaStream_t)stream>>>(x, signs);
     return (int)cudaGetLastError();
@@ -77,6 +77,7 @@ int bonsai_p40_fwht(float * x, const float * signs, int64_t n, bonsai_stream str
 
 int bonsai_p40_rmsnorm(const float * x, const float * w, float * y,
                        int64_t n_rows, int64_t n, float eps, bonsai_stream stream) {
+    if (n <= 0 || n_rows <= 0) return (n <= 0) ? 1 : 0;
     const int threads = (int)((n < 1024) ? ((n + 31) / 32) * 32 : 1024);
     rmsnorm_p40_kernel<<<(unsigned)n_rows, threads, 0, (cudaStream_t)stream>>>(x, w, y, (int)n, eps);
     return (int)cudaGetLastError();

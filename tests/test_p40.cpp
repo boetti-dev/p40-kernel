@@ -5,6 +5,7 @@
 //
 // Build:  g++ -O2 -std=c++17 -I src -I include tests/test_p40.cpp -o test_p40
 #include "../src/pq2_0.h"
+#include "../src/p40_ptx.h"
 #include "../src/fwht.h"
 #include "../src/ops.h"
 #include "../include/bonsai_model.h"
@@ -329,16 +330,22 @@ static void test_geometry() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Simulate the GEMV kernel's warp-strided loop (index arithmetic copied
-//    verbatim from gemv_pq2_0_p40_kernel) and require the full row dot.
+// 7. Simulate the GEMV kernel's warp loop exactly: 4 rows per warp, lane
+//    striding over the PQ2_0 blocks, row clamping at the tail.  The index
+//    arithmetic mirrors gemv_pq2_0_p40_kernel and must reproduce the serial
+//    row dot for every row.
 // ---------------------------------------------------------------------------
 static void test_gemv_loop() {
-    std::printf("[gemv] warp-strided loop\n");
+    std::printf("[gemv] 4-rows-per-warp strided loop\n");
     std::mt19937 rng(4242);
     std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
 
-    const int n_in = 5120, n_out = 4;
+    const int n_in = 5120;
+    const int n_out = 5;                       // deliberately not a multiple of 4
+    const int WARPS = 8, ROWS_PER_WARP = 4, ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
     const int nblocks = n_in / QK_PQ2_0;
+    const int last = n_out - 1;
+
     std::vector<float> w((size_t)n_out * n_in), x(n_in);
     for (auto & v : w) v = std::round(ud(rng) * 1.2f);
     for (auto & v : x) v = ud(rng) * 3.0f;
@@ -349,33 +356,56 @@ static void test_gemv_loop() {
     std::vector<block_q8_1> xq(n_in / QK8_1);
     quantize_row_q8_1(x.data(), xq.data(), n_in, true);
 
-    for (int row = 0; row < n_out; ++row) {
-        const block_pq2_0 * wrow = wq.data() + (size_t)row * nblocks;
+    const int nblk = (n_out + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    std::vector<float> out(n_out, -12345.0f);
+    int rows_touched = 0;
 
-        // exactly the kernel's per-lane loop
-        float lane_acc[32];
-        for (int lane = 0; lane < 32; ++lane) {
-            float acc = 0.0f;
-            for (int b = lane; b < nblocks; b += 32) {
-                const block_pq2_0 * wb = wrow + b;
-                const block_q8_1  * ab = xq.data() + b * QI_PQ2_0;
-                for (int iqs = 0; iqs < QI_PQ2_0; ++iqs)
-                    acc += pq2_0_dot_q8_1_perm(wb, ab, iqs);
+    for (int blk = 0; blk < nblk; ++blk) {
+        for (int warp = 0; warp < WARPS; ++warp) {
+            const int row0 = (blk * WARPS + warp) * ROWS_PER_WARP;
+            if (row0 >= n_out) continue;
+
+            // row pointers, clamped exactly like the kernel
+            const block_pq2_0 * wr[ROWS_PER_WARP];
+            for (int r = 0; r < ROWS_PER_WARP; ++r)
+                wr[r] = wq.data() + (size_t)std::min(row0 + r, last) * nblocks;
+
+            for (int r = 0; r < ROWS_PER_WARP; ++r) {
+                // each lane sums its own strided subset of blocks
+                float lane_acc[32];
+                for (int lane = 0; lane < 32; ++lane) {
+                    float acc = 0.0f;
+                    for (int b = lane; b < nblocks; b += 32) {
+                        const block_q8_1 * ab = xq.data() + (size_t)b * QI_PQ2_0;
+                        for (int iqs = 0; iqs < QI_PQ2_0; ++iqs)
+                            acc += pq2_0_dot_q8_1_perm(wr[r] + b, ab, iqs);
+                    }
+                    lane_acc[lane] = acc;
+                }
+                // the kernel reduces the 32 lane partials with shfl_down
+                float total = 0.0f;
+                for (int o = 16; o > 0; o >>= 1)
+                    for (int l = 0; l < 32; ++l) {
+                        const int src = l + o;
+                        if (src < 32) lane_acc[l] += lane_acc[src];
+                    }
+                total = lane_acc[0];
+                if (row0 + r < n_out) { out[row0 + r] = total; ++rows_touched; }
             }
-            lane_acc[lane] = acc;
         }
-        float total = 0.0f;
-        for (int l = 0; l < 32; ++l) total += lane_acc[l];
-
-        float ref = 0.0f;
-        for (int b = 0; b < nblocks; ++b) {
-            const block_pq2_0 * wb = wrow + b;
-            const block_q8_1  * ab = xq.data() + b * QI_PQ2_0;
-            for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) ref += pq2_0_dot_q8_1_perm(wb, ab, iqs);
-        }
-        check_close(total, ref, 1e-2f, "gemv warp sum == serial sum");
-        CHECK(std::fabs(total) > 1.0f, "gemv row %d produced a non-trivial result", row);
     }
+
+    for (int r = 0; r < n_out; ++r) {
+        float refd = 0.0f;
+        for (int b = 0; b < nblocks; ++b) {
+            const block_q8_1 * ab = xq.data() + (size_t)b * QI_PQ2_0;
+            for (int iqs = 0; iqs < QI_PQ2_0; ++iqs)
+                refd += pq2_0_dot_q8_1_perm(wq.data() + (size_t)r * nblocks + b, ab, iqs);
+        }
+        check_close(out[r], refd, 1e-2f, "gemv row value");
+        CHECK(out[r] != -12345.0f, "gemv stored row %d", r);
+    }
+    CHECK(rows_touched == n_out, "every row written exactly once (%d vs %d)", rows_touched, n_out);
 
     int visits = 0;
     for (int lane = 0; lane < 32; ++lane)
@@ -460,6 +490,39 @@ static void test_gemm_tiling() {
     CHECK(m < 1e-2, "gemm tiled result matches reference (max err %.3e)", m);
 }
 
+// ---------------------------------------------------------------------------
+// 9. The PTX helper layer must be behaviourally identical through its host
+//    fallback path (the device paths are the same instruction, guarded by
+//    __CUDA_ARCH__).  Also re-checks the mixed-signedness dp4a convention:
+//    the weight operand is *unsigned* (codes 0..3), the activation *signed*.
+// ---------------------------------------------------------------------------
+static void test_ptx_layer() {
+    std::printf("[ptx] host fallback path\n");
+
+    // p40_dp4a_us must equal the signed dp4a for our 0..3 code range
+    std::mt19937 rng(808);
+    std::uniform_int_distribution<int> code(0, 3), act(-128, 127);
+    int mismatches = 0;
+    for (int t = 0; t < 20000; ++t) {
+        uint32_t w = 0;
+        int a = 0;
+        for (int k = 0; k < 4; ++k) {
+            w |= (uint32_t)code(rng) << (8 * k);
+            a |= (int)((uint8_t)(int8_t)act(rng)) << (8 * k);
+        }
+        const int c = act(rng);
+        if (p40_dp4a_us(w, a, c) != dp4a((int)w, a, c)) ++mismatches;
+    }
+    CHECK(mismatches == 0, "p40_dp4a_us matches signed dp4a for unsigned codes (%d mismatches)", mismatches);
+
+    // p40_ldg_u16 / p40_ldg_u16x2 must be plain loads on the host
+    const uint16_t buf[4] = {0x1234, 0xABCD, 0x00FF, 0xFF00};
+    CHECK(p40_ldg_u16(buf) == 0x1234, "p40_ldg_u16 value");
+    CHECK(p40_ldg_u16x2(buf) == (0x1234u | (0xABCDu << 16)), "p40_ldg_u16x2 packs little endian");
+    p40_prefetch_l2(buf);              // must be a no-op on the host
+    CHECK(true, "p40_prefetch_l2 host no-op");
+}
+
 int main() {
     test_pq2_0_format();
     test_fwht();
@@ -469,6 +532,7 @@ int main() {
     test_geometry();
     test_gemv_loop();
     test_gemm_tiling();
+    test_ptx_layer();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

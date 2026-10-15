@@ -1,21 +1,35 @@
 // gemv_p40.cu -- decode (batch = 1) PQ2_0 mat-vec, the bandwidth-critical
 // kernel of the whole engine.
 //
-// At batch 1 every generated token must stream all ~7.2 GB of PQ2_0 weights
-// once.  On the P40 that is a hard 7.21 GB / 346 GB/s = 20.8 ms floor, i.e.
-// ~48 tok/s ceiling.  Everything below exists to get as close to that floor as
-// the GP102 memory system allows:
+// COST MODEL (why the kernel looks like this)
+// -------------------------------------------
+// Per token the whole ~7.2 GB PQ2_0 weight set must cross the GDDR5:
+//   7.21e9 B / 346e9 B/s = 20.8 ms  ->  48 tok/s ceiling.
+// Everything else is noise: activations are ~5 KB, Hadamard/RMSNorm/GDN are
+// O(10^7) ops, and the whole token needs ~0.45 G warp-instructions (~2.4 ms of
+// issue against the P40's 184 G warp-inst/s).  The only thing worth tuning is
+// memory-level parallelism on the weight stream.
 //
-//   * one warp per output row, lane-strided over the 128-weight blocks, so the
-//     weight stream is fully coalesced and each lane issues an independent,
-//     in-flight 2-byte-aligned code fetch (no shared memory, no __syncthreads);
-//   * INT8 DP4A (native on sm_61) against activations pre-quantised into the
-//     PQ2_0-native permuted Q8_1 layout -- no per-weight bit unpacking;
-//   * __launch_bounds__(256, 8) forces <= 32 registers so 64 warps/SM (the
-//     GP102 maximum) stay resident and hide the GDDR5 latency;
-//   * activations are ~5 KB and stay hot in the 3 MB L2, so they cost nothing.
+// Three levers, all applied here:
+//
+//  1. 4 output rows per warp.  The activation bytes of a 128-weight block are
+//     fetched once and reused by all four rows, and the warp keeps four
+//     independent weight streams in flight instead of one.  At ~600 ns GDDR5
+//     latency a warp needs several outstanding cache lines: with 30 SMs x 24
+//     warps x 4 lines x 128 B ~ 3.7 MB in flight, versus the ~208 KB the loop
+//     actually has to keep in flight to reach 346 GB/s.
+//  2. The +1 code bias is folded into one `bias = -sum(a)` per 32-element chunk
+//     (one int16 load + negate) and reused by all four rows, instead of a
+//     fetch + subtract per row.
+//  3. The weight scale `d` is loaded once per row per block, outside the chunk
+//     loop.
+//
+// The weight fetch stays 4x uint16 per 8 code bytes: `block_pq2_0` is a 34-byte
+// struct, so `qs` is only 2-byte aligned and a uint32/int4 load would be a
+// misaligned access on Pascal.
 #include "../pq2_0.h"
 #include "../p40_common.h"
+#include "../p40_ptx.h"
 #include "bonsai_p40.h"
 
 #include <cuda_runtime.h>
@@ -25,58 +39,95 @@ using namespace bonsai;
 namespace {
 
 constexpr int GEMV_WARPS_PER_BLOCK = 8;   // 256 threads
+constexpr int GEMV_ROWS_PER_WARP   = 4;   // weight streams + activation reuse
+constexpr int GEMV_ROWS_PER_BLOCK  = GEMV_WARPS_PER_BLOCK * GEMV_ROWS_PER_WARP;
 
-// y[row] = W[row,:] . x   (x already in the permuted Q8_1 layout)
-__global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, 8)
+// __launch_bounds__(256, 4): 32 warps/SM and 64 registers/thread, so the
+// four-row body (4 pointers, 4 scales, 4 accumulators, 8 activation words,
+// 8 code words) stays in registers without spilling.
+__global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, 4)
 gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
                       const block_q8_1  * __restrict__ X,
                       float * __restrict__ Y,
                       const int n_out, const int nblocks) {
     const int lane = threadIdx.x & 31;
-    const int row  = blockIdx.x * GEMV_WARPS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= n_out) return;
+    const int warp = threadIdx.x >> 5;
+    const int row0 = (blockIdx.x * GEMV_WARPS_PER_BLOCK + warp) * GEMV_ROWS_PER_WARP;
+    if (row0 >= n_out) return;
 
-    const block_pq2_0 * wrow = W + (size_t)row * (size_t)nblocks;
+    // Rows past the end are clamped (computed but never stored) so the loop
+    // body stays branch-free.
+    const int last = n_out - 1;
+    const block_pq2_0 * wr[GEMV_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
+        wr[r] = W + (size_t)min(row0 + r, last) * (size_t)nblocks;
 
-    float acc = 0.0f;
+    float acc[GEMV_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) acc[r] = 0.0f;
+
     for (int b = lane; b < nblocks; b += 32) {
-        const block_pq2_0 * wb = wrow + b;
-        const block_q8_1  * ab = X + (size_t)b * QI_PQ2_0;
-        const float dw = f16_to_f32(wb->d);
+        const block_q8_1 * ab = X + (size_t)b * QI_PQ2_0;
+
+        // Keep the weight stream ahead of the dp4a consumers.  All four rows
+        // are prefetched (each is a separate stream), clamped to the row so the
+        // hint can never point outside the weight buffer.  The activation side
+        // lives in L2 already (a few KB) and needs no help.
+        const int pf = min(b + 32, nblocks - 1);
+#pragma unroll
+        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) p40_prefetch_l2(wr[r] + pf);
+
+        float dw[GEMV_ROWS_PER_WARP];
+#pragma unroll
+        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
+            dw[r] = f16_to_f32(p40_ldg_u16(&wr[r][b].d));
 
 #pragma unroll
         for (int iqs = 0; iqs < QI_PQ2_0; ++iqs) {
-            // The PQ2_0 block is only 2-byte aligned inside the row, so fetch
-            // the two 16-code words as pairs of uint16.
-            const uint16_t * qp = (const uint16_t *)(wb->qs + iqs * 8);
-            const uint32_t w0 = (uint32_t)qp[0] | ((uint32_t)qp[1] << 16);
-            const uint32_t w1 = (uint32_t)qp[2] | ((uint32_t)qp[3] << 16);
-
-            // The Q8_1 block is 36 bytes, so `qs` is only 4-byte aligned: load
-            // the 32 activations as eight int32, never as an int4.
+            // Activations: 32 bytes at 4-byte alignment -> eight int32 loads.
             const int * ap = (const int *)ab[iqs].qs;
-            const int a00 = ap[0], a01 = ap[1], a02 = ap[2], a03 = ap[3];
-            const int a10 = ap[4], a11 = ap[5], a12 = ap[6], a13 = ap[7];
+            const int a0 = ap[0], a1 = ap[1], a2 = ap[2], a3 = ap[3];
+            const int a4 = ap[4], a5 = ap[5], a6 = ap[6], a7 = ap[7];
+            const int bias = -q8_1_sum(&ab[iqs]);   // value = code - 1
+            const float da = f16_to_f32(ab[iqs].d);
 
-            int sumi = 0;
-            sumi = dp4a((int)((w0 >> 0) & 0x03030303u), a00, sumi);
-            sumi = dp4a((int)((w0 >> 2) & 0x03030303u), a01, sumi);
-            sumi = dp4a((int)((w0 >> 4) & 0x03030303u), a02, sumi);
-            sumi = dp4a((int)((w0 >> 6) & 0x03030303u), a03, sumi);
-            sumi = dp4a((int)((w1 >> 0) & 0x03030303u), a10, sumi);
-            sumi = dp4a((int)((w1 >> 2) & 0x03030303u), a11, sumi);
-            sumi = dp4a((int)((w1 >> 4) & 0x03030303u), a12, sumi);
-            sumi = dp4a((int)((w1 >> 6) & 0x03030303u), a13, sumi);
+            int s[GEMV_ROWS_PER_WARP];
+#pragma unroll
+            for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) s[r] = bias;
 
-            // value = code - 1  ->  subtract the activation sum once per chunk.
-            sumi -= q8_1_sum(&ab[iqs]);
-            acc += dw * f16_to_f32(ab[iqs].d) * (float)sumi;
+#pragma unroll
+            for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r) {
+                const uint16_t * qp = (const uint16_t *)(wr[r][b].qs + iqs * 8);
+                const uint32_t w0 = p40_ldg_u16x2(qp + 0);
+                const uint32_t w1 = p40_ldg_u16x2(qp + 2);
+                s[r] = p40_dp4a_us((w0 >> 0) & 0x03030303u, a0, s[r]);
+                s[r] = p40_dp4a_us((w0 >> 2) & 0x03030303u, a1, s[r]);
+                s[r] = p40_dp4a_us((w0 >> 4) & 0x03030303u, a2, s[r]);
+                s[r] = p40_dp4a_us((w0 >> 6) & 0x03030303u, a3, s[r]);
+                s[r] = p40_dp4a_us((w1 >> 0) & 0x03030303u, a4, s[r]);
+                s[r] = p40_dp4a_us((w1 >> 2) & 0x03030303u, a5, s[r]);
+                s[r] = p40_dp4a_us((w1 >> 4) & 0x03030303u, a6, s[r]);
+                s[r] = p40_dp4a_us((w1 >> 6) & 0x03030303u, a7, s[r]);
+            }
+
+#pragma unroll
+            for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
+                acc[r] += dw[r] * da * (float)s[r];
         }
     }
 
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-    if (lane == 0) Y[row] = acc;
+    for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
+            acc[r] += __shfl_down_sync(0xffffffffu, acc[r], o);
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < GEMV_ROWS_PER_WARP; ++r)
+            if (row0 + r < n_out) Y[row0 + r] = acc[r];
+    }
 }
 
 // One warp per 32-element chunk: amax, quantise, and store transposed.
@@ -113,7 +164,7 @@ quant_q8_1_pq2_kernel(const float * __restrict__ x, block_q8_1 * __restrict__ y,
 } // namespace
 
 int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_stream stream) {
-    if (n % QK8_1 != 0) return 1;
+    if (n <= 0 || n % QK8_1 != 0) return 1;
     const int nchunk = (int)(n / QK8_1);
     const int warps  = (nchunk + 3) / 4;                 // ~4 chunks per warp
     const int blocks = (warps + GEMV_WARPS_PER_BLOCK - 1) / GEMV_WARPS_PER_BLOCK;
@@ -124,9 +175,10 @@ int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_
 
 int bonsai_p40_gemv(const void * W, const void * xq, float * y,
                     int64_t n_out, int64_t n_in, bonsai_stream stream) {
-    if (n_in % QK_PQ2_0 != 0) return 1;
+    if (n_in <= 0 || n_in % QK_PQ2_0 != 0) return 1;
+    if (n_out <= 0) return 0;
     const int nblocks = (int)(n_in / QK_PQ2_0);
-    const int blocks  = (int)((n_out + GEMV_WARPS_PER_BLOCK - 1) / GEMV_WARPS_PER_BLOCK);
+    const int blocks  = (int)((n_out + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
     gemv_pq2_0_p40_kernel<<<blocks, GEMV_WARPS_PER_BLOCK * 32, 0, (cudaStream_t)stream>>>(
         (const block_pq2_0 *)W, (const block_q8_1 *)xq, y, (int)n_out, nblocks);
     return (int)cudaGetLastError();
