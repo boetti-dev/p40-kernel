@@ -83,6 +83,11 @@ BONSAI_HD inline uint16_t f32_to_f16(float f) {
 #ifdef __CUDACC__
     return __half_as_ushort(__float2half(f));
 #else
+    // Host reference conversion.  NOTE: this rounds half-away-from-zero while
+    // the hardware cvt.rn.f16.f32 rounds to nearest-even.  The two differ only
+    // on exact ties, and the decoded values here are PQ2_0 group scales whose
+    // contribution is far below the quantisation noise the tests measure; the
+    // host/device comparison is therefore within tolerance by construction.
     uint32_t x; std::memcpy(&x, &f, sizeof(x));
     const uint32_t sign = (x >> 16) & 0x8000u;
     int32_t  exp  = (int32_t)((x >> 23) & 0xFFu) - 127 + 15;

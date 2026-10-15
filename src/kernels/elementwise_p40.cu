@@ -41,6 +41,10 @@ __global__ void fwht_1024_p40_kernel(float * __restrict__ x, const float * __res
 }
 
 // One block per row; block reduction over the row.
+// The device uses rsqrtf (the approximate reciprocal square root, ~2^-22
+// relative error) while ops.h uses 1/sqrtf for the host reference.  The
+// difference is orders of magnitude below the PQ2_0 weight quantisation, and
+// the host verification compares host-to-host so the two never mix.
 __global__ void rmsnorm_p40_kernel(const float * __restrict__ x, const float * __restrict__ w,
                                    float * __restrict__ y, const int n, const float eps) {
     __shared__ float red[32];
