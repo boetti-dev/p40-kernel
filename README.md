@@ -33,6 +33,7 @@ zugeschnitten.
 | `tests/test_p40.cpp` | Host-Verifikation der gesamten Kernel-Mathematik |
 | `tools/check_gguf.py` | Prüft die Kernel-Konstanten gegen die echte GGUF-Datei |
 | `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |
+| `tools/gpu_predict.py` | Decode-/Prefill-Vorhersage für eine beliebige Karte aus Bandbreite/MACs |
 | `tools/build_p40.sh` | Build für `sm_61` + Host-Tests |
 
 ## 2. Die Karte: warum hier alles anders ist als bei Ampere/Ada
