@@ -34,6 +34,7 @@ zugeschnitten.
 | `tools/check_gguf.py` | Prüft die Kernel-Konstanten gegen die echte GGUF-Datei |
 | `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |
 | `tools/gpu_predict.py` | Decode-/Prefill-Vorhersage für eine beliebige Karte aus Bandbreite/MACs |
+| `docs/MTP.md` | Kann das Modell MTP, kann der Kernel es? (Antwort: Modell ja/Community-Paket, Kernel nein) |
 | `tools/build_p40.sh` | Build für `sm_61` + Host-Tests |
 
 ## 2. Die Karte: warum hier alles anders ist als bei Ampere/Ada

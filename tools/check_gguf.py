@@ -129,11 +129,14 @@ def main():
             fails.append(f"{k}: got {got}, want {want}")
 
     shapes = {}
+    mtp_tensors = []
     try:
         for _ in range(n_tensors):
             name = r.s(); nd = r.u32()
             dims = [r.u64() for _ in range(nd)]
             tt = r.u32(); r.u64()
+            if re.search(r"nextn|mtp|draft|eagle", name, re.I):
+                mtp_tensors.append(name)
             g = re.sub(r"blk\.\d+\.", "blk.X.", name)
             shapes.setdefault((g, tuple(dims), tt), 0)
             shapes[(g, tuple(dims), tt)] += 1
@@ -152,6 +155,19 @@ def main():
         print(f"  {'OK ' if ok else 'BAD'} {g:32s} dims={dims} type={tt} x{cnt}")
         if not ok:
             fails.append(f"{g}: dims={dims} type={tt} x{cnt}, want ({n_in},{n_out}) type={etype} x{want_count}")
+
+    print()
+    if mtp_tensors:
+        print(f"MTP/nextn block detected: {len(mtp_tensors)} tensors")
+        for n in mtp_tensors[:6]:
+            print(f"  e.g. {n}")
+        fails.append(
+            "this file carries an MTP (nextn) block; the Bonsai-P40 kernel has no "
+            "MTP support (no nextn layer, no small-batch verify path, no second "
+            "cache stream) -- see docs/MTP.md. The trunk weights are still valid; "
+            "a context that would use MTP cannot be built with this engine.")
+    else:
+        print("MTP/nextn block: none (trunk-only file, matches the engine)")
 
     print()
     if fails:
