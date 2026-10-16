@@ -33,6 +33,7 @@ zugeschnitten.
 | `tests/test_p40.cpp` | Host-Verifikation der gesamten Kernel-Mathematik |
 | `tools/check_gguf.py` | Prüft die Kernel-Konstanten gegen die echte GGUF-Datei |
 | `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |
+| `tools/regs.sh` | ptxas-Register-/Spill-Report pro Kernel (erster Diagnoseschritt) |
 | `tools/gpu_predict.py` | Decode-/Prefill-Vorhersage für eine beliebige Karte aus Bandbreite/MACs |
 | `docs/MTP.md` | Kann das Modell MTP, kann der Kernel es? (Antwort: Modell ja/Community-Paket, Kernel nein) |
 | `docs/MMQ.md` | Was MMQ auf Pascal ist, warum es hier *nicht* drin ist und wann man es nimmt |

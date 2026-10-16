@@ -266,6 +266,19 @@ cd p40-kernel
 # -> build/libbonsai_p40.a  + Host-Tests laufen mit
 ```
 
+Register-/Spill-Report der Kernel (**erster Schritt bei Performance-Fragen**):
+
+```bash
+./tools/regs.sh              # alle Kernel
+./tools/regs.sh gemv         # nur gemv_p40.cu
+```
+
+Zu prüfen: `Used N registers` für `gemv_pq2_0_p40_kernel` muss **<= 64** sein
+(wegen `__launch_bounds__(256,4)`). Steht dort mehr oder `spill stores/loads > 0`,
+sind Spills die Ursache der gemessenen Regression — dann Launch-Bounds
+lockern (`__launch_bounds__(256, 2)` → 128 Register) und den A/B aus
+Schritt 7 wiederholen. Siehe `docs/MEASURED.md`.
+
 SASS/PTX der Kernel ansehen (prüft die Behauptungen aus
 `docs/P40_OPTIMIZATION.md`):
 
@@ -290,6 +303,7 @@ python3 tools/gpu_predict.py --bw 346 --sm 30 --fp32-per-sm 128 --name "mein P40
 |---|---|
 | `nvcc --list-gpu-arch` ohne `compute_61` | Toolkit zu neu (CUDA 13 hat Pascal entfernt) → CUDA 12.x installieren |
 | `cmake: command not found` | `sudo apt install cmake` |
+| `fatal error: bonsai_p40.h: Datei nicht gefunden` | Include-Pfad fehlt: `bonsai_p40.h` liegt in `include/`, also `-I src -I include` angeben (oder einfach `./tools/regs.sh` benutzen) |
 | Build bricht in `bonsai-p40/*.cu` ab | Fehlermeldung komplett aufbewahren (Schritt 10) |
 | `bonsai-p40:`-Zeile fehlt | `compute_cap` prüfen; ist `BONSAI_P40` auf `0` gesetzt? |
 | Leere Antworten | `-n` zu klein (Reasoning frisst das Budget) → `-n 16384 -c 65536` |
