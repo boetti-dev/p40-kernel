@@ -108,13 +108,15 @@ WHAT TO LOOK FOR
   min_blocks=6 -> <= 42 regs -> 6 blocks/SM -> 48 warps/SM ->  75%
   min_blocks=4 -> <= 64 regs -> 4 blocks/SM -> 32 warps/SM ->  50%
 
-  gemv_pq2_0_p40_kernel
-    rows=4 : needs ~64 regs.  Expect regs=64 and spill_stores=0.  That is the
-             configuration that was MEASURED at 11.39 tok/s vs the stock 21.90
-             (docs/MEASURED.md): the 1.92x regression matches the 64/32
-             occupancy ratio.  Forcing min_blocks=8 here SPILLS -> strictly worse.
-    rows=1 : needs far fewer regs.  Expect regs<=32 and spill_stores=0, i.e.
-             full occupancy -- the configuration worth measuring next.
+  gemv_pq2_0_p40_kernel  (all three MEASURED on a real P40, docs/MEASURED.md)
+    rows=1 : regs=32, 64 warps/SM -> 17.34 tok/s   <- default, best variant
+    rows=2 : regs=40, 48 warps/SM -> untested
+    rows=4 : regs=64, 32 warps/SM -> 11.39 tok/s   <- the original regression
+    stock  : ~15-25 regs, 64 warps/SM -> 21.91 tok/s  <- still faster than all
+
+  Occupancy explained 57% of the rows=4 gap; the rest is architectural (no
+  shared-memory activation staging -> 4.24x more L2 read traffic than weight
+  traffic).  See docs/MEASURED.md section 6.
 
   Any non-zero "spill stores" is a red flag: spills live in local memory, which
   is DRAM traffic, on a kernel that is already bandwidth-bound.

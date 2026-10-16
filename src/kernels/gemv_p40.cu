@@ -56,7 +56,10 @@ constexpr int GEMV_WARPS_PER_BLOCK = 8;   // 256 threads
 //   nvcc ... -DBONSAI_GEMV_ROWS=1 -Xptxas -v -c src/kernels/gemv_p40.cu
 //   then the A/B in docs/WORKFLOW.md step 7.
 #ifndef BONSAI_GEMV_ROWS
-#define BONSAI_GEMV_ROWS 4
+// MEASURED on a P40: 1 -> 17.34 tok/s, 2 -> untested, 4 -> 11.39 tok/s
+// (stock path: 21.91).  Default is the best variant of this kernel, but the
+// kernel is still slower than stock -- see docs/MEASURED.md.
+#define BONSAI_GEMV_ROWS 1
 #endif
 
 // NOTE: the branch test must use the MACRO, not the constexpr below.  The

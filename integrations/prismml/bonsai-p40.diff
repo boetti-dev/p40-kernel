@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index b687cd5..ee88e16 100644
+index b687cd5..e7fb8f9 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
 @@ -103,6 +103,10 @@ if (CUDAToolkit_FOUND)
@@ -24,7 +24,7 @@ index b687cd5..ee88e16 100644
 +#   1 -> 32 regs -> 64 warps/SM (full occupancy)
 +#   2 -> 40 regs -> 48 warps/SM
 +#   4 -> 64 regs -> 32 warps/SM (the configuration measured at 11.39 vs 21.90 tok/s)
-+set(BONSAI_GEMV_ROWS "4" CACHE STRING "output rows per warp for the P40 PQ2_0 GEMV (1, 2 or 4)")
++set(BONSAI_GEMV_ROWS "1" CACHE STRING "output rows per warp for the P40 PQ2_0 GEMV (1, 2 or 4)")
 +target_compile_definitions(ggml-cuda PRIVATE
 +    "$<$<COMPILE_LANGUAGE:CUDA>:BONSAI_GEMV_ROWS=${BONSAI_GEMV_ROWS}>")
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/README.md b/ggml/src/ggml-cuda/bonsai-p40/README.md
@@ -330,10 +330,10 @@ index 0000000..bd043b1
 +                        struct ggml_tensor * dst, cudaStream_t stream);
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu b/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
 new file mode 100644
-index 0000000..daca570
+index 0000000..dbda457
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,219 @@
 +// gemv_p40.cu -- decode (batch = 1) PQ2_0 mat-vec, the bandwidth-critical
 +// kernel of the whole engine.
 +//
@@ -392,7 +392,10 @@ index 0000000..daca570
 +//   nvcc ... -DBONSAI_GEMV_ROWS=1 -Xptxas -v -c src/kernels/gemv_p40.cu
 +//   then the A/B in docs/WORKFLOW.md step 7.
 +#ifndef BONSAI_GEMV_ROWS
-+#define BONSAI_GEMV_ROWS 4
++// MEASURED on a P40: 1 -> 17.34 tok/s, 2 -> untested, 4 -> 11.39 tok/s
++// (stock path: 21.91).  Default is the best variant of this kernel, but the
++// kernel is still slower than stock -- see docs/MEASURED.md.
++#define BONSAI_GEMV_ROWS 1
 +#endif
 +
 +// NOTE: the branch test must use the MACRO, not the constexpr below.  The

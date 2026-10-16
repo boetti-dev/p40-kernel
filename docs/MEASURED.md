@@ -173,7 +173,74 @@ verbleibende Unterschied ist, dass die PQ2_0-native Permutation pro Gewicht zwei
 `__byte_perm` spart — und die P40 ist dafür nicht instruktionsgebunden. Ich
 rechne mit **Gleichstand, nicht mit Gewinn**.
 
-## 6. Die Änderung, die daraus folgt
+## 6. Ergebnis des `rows=1`-Tests: Occupancy war die Haelfte, Architektur der Rest
+
+```
+=== BONSAI_P40=1 (rows=1) ===   tg128  17.34 +/- 0.00
+=== BONSAI_P40=0 (stock) ===   tg128  21.91 +/- 0.01
+```
+
+| Konfiguration | tok/s | effektiv | % der Peak | Occupancy |
+|---|---|---|---|---|
+| rows=4 | 11.39 | 81.9 GB/s | 23.7 % | 50 % |
+| **rows=1** | **17.34** | **124.7 GB/s** | **36.0 %** | **100 %** |
+| Stock | **21.91** | 157.5 GB/s | 45.5 % | 100 % |
+
+* **Die Occupancy-Hypothese ist bestaetigt.** rows=4 -> rows=1 bringt **1.52x**,
+  bei gleicher Occupancy (64 Warps/SM). Die Occupancy erklaert damit **57 %**
+  der urspruenglichen Luecke.
+* **Es bleibt 1.26x zum Stock** (21.91 / 17.34), bei *gleicher* Occupancy. Der
+  Rest ist also nicht Tuning, sondern Architektur.
+
+### Was die Restluecke erklaert: Aktivierungs-Traffic
+
+Mein Kernel hat **kein Shared-Memory-Staging** der Aktivierung. Jeder Warp
+liest sie pro Zeile neu aus L2. Bei 4 Zeilen/Warp war das noch 1x pro 4 Zeilen;
+bei rows=1 ist es **1x pro Zeile**:
+
+| Matvec | Aktivierungen aus L2 | Gewichte aus DRAM | Faktor |
+|---|---|---|---|
+| 5120 -> 17408 | **100.27 MB** | 23.67 MB | **4.24x** |
+| 5120 ->  6144 | 35.39 MB | 8.36 MB | 4.24x |
+| 17408 -> 5120 | 100.27 MB | 23.67 MB | 4.24x |
+
+Der Kernel erzeugt also **4.24x so viel L2-Leseverkehr wie DRAM-Gewichtsverkehr**.
+L2 ist schneller als DRAM, aber diese Menge konkurriert mit dem Gewichtsstrom um
+Bandbreite und MMU, und sie ist voellig vermeidbar: der Stock-Pfad quantisiert
+die Aktivierung **einmal pro Block in Shared Memory**, und alle Zeilen des
+Blocks lesen sie von dort.
+
+Dazu kommt der **zusaetzliche, serialisierte Quantisierungs-Launch**: mein Pfad
+macht zwei abhaengige Launches pro MUL_MAT (~400 pro Token), der Stock einen
+gefusten. Die Mehrzeit von 12.03 ms/Token entspricht 30 us pro MUL_MAT — zu viel
+fuer einen reinen Launch (3-8 us), aber konsistent mit Launch *plus*
+Abhaengigkeitsstall *plus* dem L2-Verkehr.
+
+### Verdikt
+
+**Der Ansatz kann den Stock-Pfad auf dieser Karte nicht schlagen.** Der Grund ist
+strukturell, nicht Feintuning:
+
+* Was der Stock-Pfad richtig macht — Quantisierung fusioniert, Aktivierung in
+  Shared Memory, damit alle Zeilen sie wiederverwenden — ist genau das, was ihn
+  auf 45.5 % der Peak-Bandbreite bringt.
+* Was mein Entwurf hinzufuegt — die vorpermutierte Aktivierung, die pro Gewicht
+  zwei `__byte_perm` spart — ist ALU-Ersparnis auf einer Karte, die **nicht**
+  instruktionsgebunden ist.
+* Um die Luecke zu schliessen, muesste ich den Kernel auf die Stock-Struktur
+  umbauen (fusionierte Quantisierung + Shared-Staging). Dann bleibt als einziger
+  Unterschied die `__byte_perm`-Ersparnis — und die ist auf der P40 wertlos.
+
+**Empfehlung: `BONSAI_P40` bleibt aus (Default).** Der Patch bleibt trotzdem im
+Repo, weil die 9 Zeilen Hook harmlos sind und die Messung reproduzierbar ist;
+und weil `-DBONSAI_GEMV_ROWS` ein sauberer Nachweis der Occupancy-Abhaengigkeit
+ist.
+
+Der Default wurde auf **rows=1** gesetzt: wer den Pfad einschaltet, bekommt die
+beste Variante dieses Kernels (17.34 statt 11.39), auch wenn sie langsamer ist
+als der Stock.
+
+## 7. Die Aenderung, die daraus folgt
 
 Der Kernel ist jetzt auf den Zeilen-pro-Warp-Wert **baubar konfigurierbar**:
 
@@ -197,7 +264,7 @@ Ob es ihn *überholt*, ist offen — der einzige verbleibende Vorteil wäre dann
 noch, dass die PQ2_0-native Permutation pro Gewicht zwei `__byte_perm` spart,
 und die P40 ist dafür nicht instruktionsgebunden.
 
-## 7. Korrigierte Zahlen
+## 8. Korrigierte Zahlen
 
 `tools/gpu_predict.py` rechnet jetzt mit kalibrierten Effizienzen:
 
@@ -213,7 +280,7 @@ und die P40 ist dafür nicht instruktionsgebunden.
 Die **V100-Vorhersage war um 1.76× zu optimistisch**; `docs/V100_PREDICTION.md`
 ist entsprechend korrigiert.
 
-## 8. Was daraus folgt
+## 9. Was daraus folgt
 
 * **Der Stock-Pfad bleibt der Standard.** Der Fork hat für PQ2_0 auf Pascal
   keine kartenspezifische Optimierung (`MMVQ_PARAMETERS_GENERIC`), aber der
@@ -231,7 +298,7 @@ ist entsprechend korrigiert.
   Makro-Kollisionsprüfung und die Analyse in `docs/MMQ.md`/`docs/MTP.md`.
   Diese Teile sind durch die Messung nicht entwertet.
 
-## 9. Reproduktion
+## 10. Reproduktion
 
 ```bash
 M=models/Ternary-Bonsai-2-27B-PQ2_0.gguf
