@@ -15,10 +15,10 @@ index b687cd5..83b934c 100644
      file(GLOB   SRCS "template-instances/fattn-mma*.cu")
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/README.md b/ggml/src/ggml-cuda/bonsai-p40/README.md
 new file mode 100644
-index 0000000..d7c4aa3
+index 0000000..6d165f6
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bonsai-p40/README.md
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,90 @@
 +# bonsai-p40 — PQ2_0 decode path for the Tesla P40 (sm_61)
 +
 +Opt-in specialization of the **batch-1 PQ2_0 mat-vec** for the NVIDIA Tesla P40
@@ -88,13 +88,14 @@ index 0000000..d7c4aa3
 +  model's widest row (32768). One model, one GPU.
 +* **Not benchmarked.** Neither a P40 nor `nvcc` was available where this was
 +  written, so the speedup versus the stock path is argued from the structure
-+  (MLP, folded bias, occupancy), not measured. Verify with `llama-bench`:
++  (MLP, folded bias, occupancy), not measured. Use the built-in A/B switch:
 +
 +  ```bash
-+  llama-bench -m Ternary-Bonsai-2-27B-PQ2_0.gguf -ngl 99 -fa on -p 0 -n 128
++  BONSAI_P40=1 llama-bench -m Ternary-Bonsai-2-27B-PQ2_0.gguf -ngl 99 -fa on -p 0 -n 128
++  BONSAI_P40=0 llama-bench -m Ternary-Bonsai-2-27B-PQ2_0.gguf -ngl 99 -fa on -p 0 -n 128
 +  ```
 +
-+  and compare with the same build where `bonsai_p40_should_use()` returns false.
++  `BONSAI_P40=0` disables the path at runtime (resolved once, no rebuild).
 +
 +## Build
 +
@@ -169,10 +170,10 @@ index 0000000..2146e09
 +#endif
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
 new file mode 100644
-index 0000000..78f0d6e
+index 0000000..4630144
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,108 @@
 +// bonsai_p40_dispatch.cu -- see bonsai_p40_dispatch.cuh.
 +//
 +// Why this is a separate translation unit at all: it lets the P40 path be a
@@ -187,6 +188,8 @@ index 0000000..78f0d6e
 +#include "p40_dispatch_predicate.h"
 +
 +#include <cuda_runtime.h>
++#include <cstdio>
++#include <cstdlib>
 +
 +using namespace bonsai;
 +
@@ -201,9 +204,28 @@ index 0000000..78f0d6e
 +// One model, one GPU, so a single buffer is enough; no context plumbing needed.
 +block_q8_1 * g_scratch = nullptr;
 +
++// A/B switch for benchmarking, resolved once so the hot path stays free:
++//   BONSAI_P40=0 llama-bench ...   -> stock path
++//   BONSAI_P40=1 llama-bench ...   -> this kernel (default)
++bool bonsai_p40_enabled() {
++    static const bool enabled = [] {
++        const char * e = std::getenv("BONSAI_P40");
++        return !(e != nullptr && e[0] == '0');
++    }();
++    return enabled;
++}
++
++// BONSAI_P40_VERBOSE=1 prints one line the first time the path takes over, so a
++// workflow can prove the kernel is actually being used.
++bool bonsai_p40_verbose() {
++    static const bool verbose = std::getenv("BONSAI_P40_VERBOSE") != nullptr;
++    return verbose;
++}
++
 +} // namespace
 +
 +bool bonsai_p40_should_use(enum ggml_type type, int cc, int64_t ne11) {
++    if (!bonsai_p40_enabled()) return false;
 +    return type == GGML_TYPE_PQ2_0 && cc == BONSAI_P40_CC && ne11 == 1;
 +}
 +
@@ -248,6 +270,15 @@ index 0000000..78f0d6e
 +    if (bonsai_p40_gemv(src0->data, g_scratch, (float *)dst->data, n_out, n_in,
 +                        (bonsai_stream)stream) != 0) {
 +        return false;
++    }
++    if (bonsai_p40_verbose()) {
++        static bool reported = false;
++        if (!reported) {
++            reported = true;
++            fprintf(stderr, "bonsai-p40: sm_61 PQ2_0 decode path active "
++                            "(n_in=%lld n_out=%lld)\n",
++                    (long long)n_in, (long long)n_out);
++        }
 +    }
 +    return true;
 +}
