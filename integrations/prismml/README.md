@@ -7,6 +7,12 @@ Hier liegt die **fertige** Integration in `PrismML-Eng/llama.cpp` — kein Entwu
 | `bonsai-p40.diff` | `git apply` (reiner Diff) |
 | `0001-bonsai-p40.patch` | `git am` / `git format-patch`-Format |
 
+> ⚠️ **Der Patch ist OPT-IN und standardmäßig AUS.** Gemessen auf einer echten
+> P40 war der Pfad **1.92× langsamer** (11.39 vs 21.90 tok/s tg128).
+> Aktivieren nur mit `BONSAI_P40=1`; Messung und Analyse in `docs/MEASURED.md`.
+> Die 9 Zeilen Hook in Bestandsdateien sind trotzdem harmlos — sie rufen nur
+> `bonsai_p40_should_use()`, das ohne `BONSAI_P40=1` `false` liefert.
+
 Basis: Branch **`prism`**, Commit **`b858f3b`** (`tests: portable popcount in
 arclab_init_hadamard (#362)`).
 

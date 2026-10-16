@@ -1,14 +1,14 @@
-From ea36db50ea50e3bd090977ab084de4d8257aafff Mon Sep 17 00:00:00 2001
+From 16ae2954506824e283a98d16c4d698462a13d83c Mon Sep 17 00:00:00 2001
 From: cline <dev@local>
-Date: Thu, 15 Oct 2026 21:07:38 +0000
+Date: Fri, 16 Oct 2026 21:21:25 +0000
 Subject: [PATCH] cuda: opt-in sm_61 PQ2_0 decode path for the Tesla P40
- (bonsai-p40)
+ (bonsai-p40, OFF by default)
 
 ---
  ggml/src/ggml-cuda/CMakeLists.txt             |   4 +
  ggml/src/ggml-cuda/bonsai-p40/README.md       |  90 ++++++++
  ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h    |  53 +++++
- .../bonsai-p40/bonsai_p40_dispatch.cu         | 108 ++++++++++
+ .../bonsai-p40/bonsai_p40_dispatch.cu         | 112 ++++++++++
  .../bonsai-p40/bonsai_p40_dispatch.cuh        |  22 ++
  ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu     | 185 +++++++++++++++++
  ggml/src/ggml-cuda/bonsai-p40/p40_common.h    | 148 ++++++++++++++
@@ -16,7 +16,7 @@ Subject: [PATCH] cuda: opt-in sm_61 PQ2_0 decode path for the Tesla P40
  ggml/src/ggml-cuda/bonsai-p40/p40_ptx.h       |  71 +++++++
  ggml/src/ggml-cuda/bonsai-p40/pq2_0.h         | 193 ++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda.cu               |   5 +
- 11 files changed, 928 insertions(+)
+ 11 files changed, 932 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/README.md
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
@@ -199,10 +199,10 @@ index 0000000..2146e09
 +#endif
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
 new file mode 100644
-index 0000000..4630144
+index 0000000..eec3f33
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,112 @@
 +// bonsai_p40_dispatch.cu -- see bonsai_p40_dispatch.cuh.
 +//
 +// Why this is a separate translation unit at all: it lets the P40 path be a
@@ -233,13 +233,17 @@ index 0000000..4630144
 +// One model, one GPU, so a single buffer is enough; no context plumbing needed.
 +block_q8_1 * g_scratch = nullptr;
 +
-+// A/B switch for benchmarking, resolved once so the hot path stays free:
-+//   BONSAI_P40=0 llama-bench ...   -> stock path
-+//   BONSAI_P40=1 llama-bench ...   -> this kernel (default)
++// OPT-IN, and OFF by default.  Measured on a real Tesla P40 this path was
++// ~2x SLOWER than the stock mmvq (11.39 vs 21.90 tok/s tg128), so it must not
++// be enabled by accident.  See docs/MEASURED.md for the numbers and the
++// analysis of why the 4-rows-per-warp premise did not hold.
++//
++//   BONSAI_P40=1 llama-bench ...   -> this kernel
++//   BONSAI_P40 unset / 0           -> stock path (default)
 +bool bonsai_p40_enabled() {
 +    static const bool enabled = [] {
 +        const char * e = std::getenv("BONSAI_P40");
-+        return !(e != nullptr && e[0] == '0');
++        return e != nullptr && e[0] == '1';
 +    }();
 +    return enabled;
 +}

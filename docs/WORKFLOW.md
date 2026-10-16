@@ -222,31 +222,39 @@ Als Server:
 
 ## 7. Der entscheidende Test: A/B-Benchmark
 
-Der Kernel ist **nicht gemessen** — das hier ist der Beweis (oder die
-Widerlegung). Der Schalter wirkt zur Laufzeit, **kein Neubauen nötig**:
+> **Bereits gemessen:** auf einer echten P40 war `BONSAI_P40=1` **1.92×
+> langsamer** (11.39 vs 21.90 tok/s). Der Pfad ist deshalb **standardmäßig
+> AUS**. Siehe `docs/MEASURED.md` — inklusive Analyse, warum die
+> 4-Zeilen-pro-Warp-Prämisse nicht hielt. Die folgenden Kommandos dienen dem
+> Nachvollziehen und dem Testen von Änderungen.
+
+Der Schalter wirkt zur Laufzeit, **kein Neubauen nötig**:
 
 ```bash
 cd llama.cpp
 M=../p40-kernel/models/Ternary-Bonsai-2-27B-PQ2_0.gguf
 
-for v in 1 0; do
+for v in 0 1; do
   echo "=== BONSAI_P40=$v ==="
   BONSAI_P40=$v ./build/bin/llama-bench -m $M -ngl 99 -fa on -p 0 -n 128
 done
 ```
 
-Erwartung: **`BONSAI_P40=1` ist bei `tg128` mindestens so schnell wie
-`BONSAI_P40=0`**, nach meiner Rechnung eher schneller (~42 tok/s Decode auf der
-P40, bandbreitengebunden).
+**Erwartung auf einer P40: `BONSAI_P40=0` (Stock) gewinnt deutlich.** Das ist
+der gemessene Stand, kein Fehler in der Installation. Die erwartete
+Größenordnung auf einer P40 ist **~22 tok/s** — nicht die 42, die eine frühere
+Version dieser Doku vorhergesagt hatte (falsche Effizienzannahme, siehe
+`docs/MEASURED.md`).
 
-* Sind beide Werte **exakt gleich**, greift der Kernel nicht →
-  `BONSAI_P40_VERBOSE=1` prüfen (Schritt 5.3).
-* Ist `BONSAI_P40=1` **langsamer**, ist mein Kernel auf echter Hardware
-  schlechter als der generische Pfad. Das ist ein legitimes Ergebnis — bitte
-  melden, dann ist die Tuning-Annahme (4 Zeilen/Warp) zu korrigieren.
+Wenn du Änderungen am Kernel testest, ist das die Messlatte:
+`BONSAI_P40=1` muss `BONSAI_P40=0` **übertreffen**, sonst ist die Änderung
+wertlos.
 
-Prefill einmal getrennt ansehen (`-p 512 -n 0`): das sollte vom Patch **nicht**
-betroffen sein, Prefill läuft weiter über den Fork-MMQ.
+* Beide Werte **exakt gleich** → der Pfad greift nicht (`BONSAI_P40_VERBOSE=1`).
+* `BONSAI_P40=1` langsamer → erwartet beim aktuellen Stand.
+
+Prefill getrennt ansehen (`-p 512 -n 0`): davon ist der Patch **nicht**
+betroffen, Prefill läuft weiter über den Fork-MMQ.
 
 ---
 

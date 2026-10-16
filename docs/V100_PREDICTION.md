@@ -1,5 +1,13 @@
 # Vorhersage: Ternary-Bonsai-2-27B auf einer Tesla V100 32 GB
 
+> **KORRIGIERT — die Zahlen unten waren ~1.76× zu optimistisch.**
+> Das ursprüngliche Modell rechnete mit 88 % der Peak-Bandbreite; gemessen
+> auf einer echten P40 sind es **45.5 %** (21.90 tok/s statt 42.2).
+> Korrigierte Werte: **P40 ~21.8 tok/s**, **V100-32GB ~62.4 tok/s**
+> (statt 109.8). Siehe `docs/MEASURED.md` für Messung, Kalibrierung und
+> Begründung. Die Zeilen unten sind historisch und NICHT korrigiert.
+
+
 Diese Vorhersage ist mit **demselben Modell** gerechnet wie die P40-Zahlen, und
 sie reproduziert sie (20.8 ms / 48 tok/s Ceiling, 8.50 GiB KV @262k, 42.2 tok/s
 realistisch vs. dokumentierte 41–44). Damit sind beide Zahlen vergleichbar.
@@ -37,7 +45,7 @@ Zwei Punkte sind für den Entwurf entscheidend:
 | | P40 | V100 32 GB |
 |---|---|---|
 | Gewichtsstrom, Peak | 20.8 ms → 48.0 tok/s | **8.0 ms → 124.8 tok/s** |
-| + 88 % realer Bandbreite | 23.7 ms → 42.2 tok/s | **9.1 ms → 109.8 tok/s** |
+| + 88 % realer Bandbreite (**falsch, siehe Banner**) | 23.7 ms → 42.2 tok/s | **9.1 ms → 109.8 tok/s** |
 | Ceiling mit **PTQ1_0** (5.95 GB) | 17.2 ms → 58.2 tok/s | **6.6 ms → 151.3 tok/s** |
 
 Mit Kontext (Q8_0-KV, 34816 B/Token, 88 % Bandbreite):

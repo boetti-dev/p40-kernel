@@ -14,7 +14,10 @@ Speicher:
 7.21e9 Byte / 346e9 Byte/s = 20.8 ms   ->   48.0 tok/s  (Hardware-Obergrenze)
 ```
 
-Realistisch (85–90 % der Peak-Bandbreite) landet man bei **~41–44 tok/s**. Das
+**KORRIGIERT (gemessen, siehe `docs/MEASURED.md`):** die P40 erreicht nur
+**45.5 % der Peak-Bandbreite**, also **157 GB/s → 21.9 tok/s**. Die frühere
+Annahme „85–90 %“ war falsch; der Stock-Pfad liegt bereits nahe am
+praktischen Limit dieser Karte. Das
 ist das Ziel; alles andere ist diesem Ziel untergeordnet.
 
 Zum Vergleich die Rechenlast pro Token: ~24.35 G MAC im Backbone ≈ 48.7 GFLOP.

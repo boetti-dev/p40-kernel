@@ -42,17 +42,47 @@ def decode_ms(bw, eff, ctx, kv_k="q8_0", kv_v="q8_0", weights=WEIGHTS_PQ2_0):
 
 
 # --- card specs -----------------------------------------------------------
+# `eff` is the FRACTION OF PEAK BANDWIDTH the decode actually reaches.  It is
+# NOT a constant: measured on the shipped model card plus a real P40 run it
+# ranges from 24% (H100, instruction/launch bound) to 71% (L4, memory bound).
+# Using a blanket 0.88 was the original error in this model -- it made every
+# prediction ~2x too optimistic.
 CARDS = {
-    # name          bw GB/s   SMs  FP32/SM  clock     L2 B      VRAM GiB
-    "P40":       dict(bw=346e9,  sms=30, fp32=128, clk=1.53e9, l2=3 << 20, vram=24),
-    "V100-32B":  dict(bw=900e9,  sms=80, fp32=64,  clk=1.53e9, l2=6 << 20, vram=32),
+    # name          bw GB/s   SMs  FP32/SM  clock     L2 B      VRAM GiB  eff
+    "P40":       dict(bw=346e9,  sms=30, fp32=128, clk=1.53e9, l2=3 << 20, vram=24,  eff=0.455),
+    "V100-32B":  dict(bw=900e9,  sms=80, fp32=64,  clk=1.53e9, l2=6 << 20, vram=32,  eff=0.50),
 }
 
+# Measured reference points (tg128, PQ2_0, from the model card + a P40 run).
+# Used by --calibrate to sanity-check the model.
+MEASURED = [
+    # name,        tok/s,  peak GB/s
+    ("P40",          21.90, 346),     # this project, real Tesla P40, stock path
+    ("P40 (bonsai)", 11.39, 346),     # this project, real Tesla P40, our kernel
+    ("L4",           29.80, 300),
+    ("RTX 4090",     81.20, 1008),
+    ("RTX 5090",    129.90, 1792),
+    ("H100 SXM",    113.90, 3350),
+    ("A100 SXM",     73.90, 2039),
+    ("L40S",         74.40, 864),
+]
 
-def describe(name, eff=0.88):
+
+def measured_efficiencies():
+    print("measured decode efficiency (tg128, PQ2_0, 6.70 GiB model):")
+    for name, tps, bw in MEASURED:
+        gbs = WEIGHTS_PQ2_0 * tps
+        print(f"  {name:14s} {tps:6.1f} tok/s -> {gbs/1e9:7.1f} GB/s "
+              f"= {100.0*gbs/(bw*1e9):5.1f}% of {bw} GB/s")
+    print()
+
+
+def describe(name, eff=None):
     c = CARDS[name]
+    if eff is None:
+        eff = c["eff"]
     print(f"=== {name}  ({c['bw']/1e9:.0f} GB/s, {c['sms']} SMs, "
-          f"{c['vram']} GiB, L2 {c['l2']>>20} MiB) ===")
+          f"{c['vram']} GiB, L2 {c['l2']>>20} MiB, eff {eff:.0%}) ===")
     print(f"  FP32 TFLOP/s : {2*c['sms']*c['fp32']*c['clk']/1e12:5.1f}")
     print(f"  issue warp/cyc: {c['sms']*4*c['clk']/1e9:6.1f} e9/s")
 
@@ -81,15 +111,21 @@ def main():
     ap.add_argument("--vram", type=float, default=32)
     ap.add_argument("--l2", type=float, default=6)
     ap.add_argument("--name", default="custom")
+    ap.add_argument("--eff", type=float, default=None,
+                    help="fraction of peak bandwidth reached (default: per-card, "
+                         "calibrated against real measurements; 0.24..0.71 in practice)")
     a = ap.parse_args()
 
     if a.bw:
         CARDS[a.name] = dict(bw=a.bw * 1e9, sms=a.sm, fp32=a.fp32_per_sm,
-                             clk=a.clk * 1e9, l2=int(a.l2 * (1 << 20)), vram=a.vram)
+                             clk=a.clk * 1e9, l2=int(a.l2 * (1 << 20)), vram=a.vram,
+                             eff=a.eff if a.eff else 0.50)
+
+    measured_efficiencies()
 
     for n in ("P40", "V100-32B", a.name):
         if n in CARDS:
-            describe(n)
+            describe(n, a.eff)
 
     # KV bytes/token for the doc table
     print("KV bytes/token:")

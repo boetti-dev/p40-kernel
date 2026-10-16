@@ -37,6 +37,7 @@ zugeschnitten.
 | `docs/MTP.md` | Kann das Modell MTP, kann der Kernel es? (Antwort: Modell ja/Community-Paket, Kernel nein) |
 | `docs/MMQ.md` | Was MMQ auf Pascal ist, warum es hier *nicht* drin ist und wann man es nimmt |
 | `docs/WORKFLOW.md` | **Kompletter Ablauf auf deinem System:** clone → verify → bauen → laufen → A/B-Benchmark |
+| **`docs/MEASURED.md`** | **MESSUNG auf echter P40: der Kernel ist 2× LANGSAMER als der Stock-Pfad.** Korrigierte Zahlen + Analyse |
 | `integrations/prismml/` | **Fertige, applybare Integration in den PrismML-Fork** (Diff + `git am`-Patch) |
 | `src/p40_dispatch_predicate.h` | Die getestete Übernahme-Entscheidung der Fork-Integration |
 | `tools/check_macro_collisions.py` | Findet Namen, die der Fork als Makro definiert (Integrations-Stolperstein) |

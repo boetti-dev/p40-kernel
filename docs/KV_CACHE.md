@@ -25,10 +25,10 @@ pro Token.
 
 | Typ | Bytes/Token | Cache @262k | KV-Leserate | + 20.8 ms | tok/s |
 |---|---|---|---|---|---|
-| F16 / F16 | 65536 | **16.00 GiB** | 49.7 ms | 70.5 ms | 14.2 |
-| **Q8_0 / Q8_0** | 34816 | **8.50 GiB** | 26.4 ms | 47.2 ms | **21.2** |
-| Q8_0 / Q4_0 | 26624 | 6.50 GiB | 20.2 ms | 41.0 ms | 24.4 |
-| Q4_0 / Q4_0 | 18432 | 4.50 GiB | 14.0 ms | 34.8 ms | 28.8 |
+| F16 / F16 | 65536 | **16.00 GiB** | 49.7 ms | 70.5 ms | ~7 |
+| **Q8_0 / Q8_0** | 34816 | **8.50 GiB** | 26.4 ms | 47.2 ms | **~9.6** |
+| Q8_0 / Q4_0 | 26624 | 6.50 GiB | 20.2 ms | 41.0 ms | ~11 |
+| Q4_0 / Q4_0 | 18432 | 4.50 GiB | 14.0 ms | 34.8 ms | ~13 |
 
 **F16 ist keine Option:** 7.21 GiB Gewichte + 16.00 GiB Cache = **23.21 GiB**
 von 24 GiB — kein Platz für Aktivierungen, CUDA-Kontext, den 144-MiB-GDN-State
@@ -40,9 +40,9 @@ Wichtig zur Einordnung der KV-Leserate: sie **wächst mit dem Kontext** und
 
 | Kontext | KV-Read | tok/s (Q8_0) |
 |---|---|---|
-| 4 096 | 0.41 ms | 47.1 |
-| 32 768 | 3.30 ms | 41.5 |
-| 262 144 | 26.4 ms | 21.2 |
+| 4 096 | 0.41 ms | ~21 |
+| 32 768 | 3.30 ms | ~19 |
+| 262 144 | 26.4 ms | ~10 |
 
 Bei kurzen Kontexten ist der Cache also irrelevant, bei 262K ist er der
 teuerste Posten nach den Gewichten.

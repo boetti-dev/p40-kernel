@@ -170,10 +170,10 @@ index 0000000..2146e09
 +#endif
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
 new file mode 100644
-index 0000000..4630144
+index 0000000..eec3f33
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,112 @@
 +// bonsai_p40_dispatch.cu -- see bonsai_p40_dispatch.cuh.
 +//
 +// Why this is a separate translation unit at all: it lets the P40 path be a
@@ -204,13 +204,17 @@ index 0000000..4630144
 +// One model, one GPU, so a single buffer is enough; no context plumbing needed.
 +block_q8_1 * g_scratch = nullptr;
 +
-+// A/B switch for benchmarking, resolved once so the hot path stays free:
-+//   BONSAI_P40=0 llama-bench ...   -> stock path
-+//   BONSAI_P40=1 llama-bench ...   -> this kernel (default)
++// OPT-IN, and OFF by default.  Measured on a real Tesla P40 this path was
++// ~2x SLOWER than the stock mmvq (11.39 vs 21.90 tok/s tg128), so it must not
++// be enabled by accident.  See docs/MEASURED.md for the numbers and the
++// analysis of why the 4-rows-per-warp premise did not hold.
++//
++//   BONSAI_P40=1 llama-bench ...   -> this kernel
++//   BONSAI_P40 unset / 0           -> stock path (default)
 +bool bonsai_p40_enabled() {
 +    static const bool enabled = [] {
 +        const char * e = std::getenv("BONSAI_P40");
-+        return !(e != nullptr && e[0] == '0');
++        return e != nullptr && e[0] == '1';
 +    }();
 +    return enabled;
 +}
