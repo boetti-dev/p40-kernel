@@ -49,6 +49,13 @@ done
 ar rcs "${BUILD}/libbonsai_p40.a" "${OBJS[@]}"
 echo "  -> ${BUILD}/libbonsai_p40.a"
 
+# --- 2b. bandwidth ceiling probe (independent of the kernels) --------------
+if [ -f "${ROOT}/tools/bwtest.cu" ]; then
+    echo "  nvcc tools/bwtest.cu"
+    "${NVCC}" -O3 -std=c++17 ${ARCH} "${ROOT}/tools/bwtest.cu" -o "${BUILD}/bwtest"
+    echo "  -> ${BUILD}/bwtest   (run it to measure the card's ceiling)"
+fi
+
 # --- 3. optional GGUF check -------------------------------------------------
 if [[ "${1:-}" == "--check-gguf" && -n "${2:-}" ]]; then
     echo
