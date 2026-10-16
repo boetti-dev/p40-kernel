@@ -1,80 +1,121 @@
 #!/usr/bin/env bash
-# regs.sh -- ptxas resource report for the P40 kernels.
+# regs.sh -- ptxas resource report for the P40 GEMV, plus a sweep over the
+# rows-per-warp configurations.
 #
-# Prints registers / shared memory / spill counts per kernel.  This is the FIRST
-# thing to check when a kernel underperforms: `__launch_bounds__(256,4)` caps the
-# kernel at 64 registers, and if the compiler has to spill, occupancy and
-# throughput collapse.  See docs/MEASURED.md.
+# This is the FIRST thing to check when the kernel underperforms: the register
+# count fixes the occupancy, and on a latency-bound bandwidth kernel the number
+# of resident warps is what matters (docs/MEASURED.md).
 #
-#   ./tools/regs.sh              # all kernels
-#   ./tools/regs.sh gemv         # only gemv_p40.cu
+#   ./tools/regs.sh              # default configuration
+#   ./tools/regs.sh sweep        # rows = 1, 2, 4 with registers/spills/occupancy
+#   BONSAI_GEMV_ROWS=1 ./tools/regs.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCH="${ARCH:-sm_61}"
 NVCC="${NVCC:-nvcc}"
+SRC="${ROOT}/src/kernels/gemv_p40.cu"
 
-# src/kernels/*.cu include "../pq2_0.h" (resolved relative to the file) and
-# "bonsai_p40.h" (lives in include/).  Both -I paths are required.
+# src/kernels/*.cu include "../pq2_0.h" (relative to the file) and
+# "bonsai_p40.h" (lives in include/).  BOTH -I paths are required.
 INCS=(-I "${ROOT}/src" -I "${ROOT}/include")
 
-case "${1:-all}" in
-    gemv) FILES=("src/kernels/gemv_p40.cu") ;;
-    gemm) FILES=("src/kernels/gemm_p40.cu") ;;
-    attn) FILES=("src/kernels/attn_p40.cu") ;;
-    elem) FILES=("src/kernels/elementwise_p40.cu") ;;
-    kv)   FILES=("src/kernels/kv_p40.cu") ;;
-    all)  FILES=(src/kernels/*.cu) ;;
-    *)    echo "usage: $0 [all|gemv|gemm|attn|elem|kv]" >&2; exit 2 ;;
-esac
+command -v "${NVCC}" >/dev/null 2>&1 || { echo "nvcc not found (set NVCC=...)" >&2; exit 1; }
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "${OUT}"' EXIT
 
-if ! command -v "${NVCC}" >/dev/null 2>&1; then
-    echo "nvcc not found (set NVCC=/path/to/nvcc)" >&2
-    exit 1
-fi
+# --- single source of truth for the mapping, asserted below ---------------
+min_blocks_for_rows() {
+    case "$1" in
+        1) echo 8 ;;   # <= 32 regs -> 64 warps/SM
+        2) echo 6 ;;   # <= 42 regs -> 48 warps/SM
+        *) echo 4 ;;   # <= 64 regs -> 32 warps/SM
+    esac
+}
+warps_for_rows() {
+    case "$1" in 1) echo 64 ;; 2) echo 48 ;; *) echo 32 ;; esac
+}
+
+# Assert the script's expectation against the REAL preprocessor behaviour of the
+# real file.  This exists because a `#if` cannot see a `constexpr int`: writing
+# `#if GEMV_ROWS_PER_WARP >= 4` silently made every configuration take the #else
+# branch (32-register cap, spills).  That shipped once.
+assert_mapping() {
+    local blk="${OUT}/blk.inc" bad=0 got want r
+    awk '/^#ifndef BONSAI_GEMV_ROWS/{f=1} f{print} f&&/^#endif/{n++} n==2{exit}' \
+        "${SRC}" > "${blk}"
+    [ -s "${blk}" ] || { echo "could not extract the config block" >&2; return 1; }
+    for r in 1 2 4; do
+        got=$( (cat "${blk}"; echo 'MB=GEMV_MIN_BLOCKS') \
+               | gcc -E -P -DBONSAI_GEMV_ROWS="$r" -x c - 2>/dev/null | tail -1 )
+        want="MB=$(min_blocks_for_rows "$r")"
+        if [ "${got}" != "${want}" ]; then
+            echo "  MISMATCH rows=${r}: preprocessor='${got}' script expects '${want}'" >&2
+            bad=1
+        fi
+    done
+    return "${bad}"
+}
+
+# Extract the two lines that matter for gemv_pq2_0_p40_kernel.
+report_one() {
+    local rows="$1" log="${OUT}/gemv_r${1}.log" obj="${OUT}/gemv_r${1}.o"
+    if ! "${NVCC}" -O3 -std=c++17 -arch="${ARCH}" --use_fast_math \
+            "${INCS[@]}" --ptxas-options=-v -DBONSAI_GEMV_ROWS="${rows}" \
+            -c "${SRC}" -o "${obj}" 2> "${log}"; then
+        echo "  COMPILE FAILED (rows=${rows}):"
+        sed 's/^/    /' "${log}" | head -20
+        return 1
+    fi
+    local regs spill stack
+    regs=$(grep -A3 'Function properties for.*gemv_pq2_0_p40_kernel' "${log}" \
+           | grep -oE 'Used [0-9]+ registers' | head -1 | grep -oE '[0-9]+' || echo '?')
+    stack=$(grep -A3 'Function properties for.*gemv_pq2_0_p40_kernel' "${log}" \
+            | grep -oE '[0-9]+ bytes spill stores' | head -1 | grep -oE '^[0-9]+' || echo 0)
+    spill=$(grep -A3 'Function properties for.*gemv_pq2_0_p40_kernel' "${log}" \
+            | grep -oE '[0-9]+ bytes stack frame' | head -1 | grep -oE '^[0-9]+' || echo 0)
+    printf '  rows=%-2s min_blocks=%-2s regs=%-4s spill_stores=%-5s stack=%-5s -> %s warps/SM%s\n' \
+        "${rows}" "$(min_blocks_for_rows "${rows}")" "${regs}" "${spill:-0}" "${stack:-0}" \
+        "$(warps_for_rows "${rows}")" \
+        "$( [ "${spill:-0}" != 0 ] && echo '  <-- SPILLS: cap too tight' )"
+}
 
 echo "ptxas resource report for ${ARCH}"
 echo
+echo "config-block check (script expectation vs. real preprocessor):"
+if assert_mapping; then echo "  OK: rows=1->8, rows=2->6, rows=4->4 min-blocks"; else
+    echo "  FAILED -- the mapping in regs.sh and in gemv_p40.cu disagree" >&2; exit 1; fi
+echo
 
-fail=0
-for f in "${FILES[@]}"; do
-    base="$(basename "${f}" .cu)"
-    echo "=== ${base} ==="
-    # shellcheck disable=SC2086
-    if ! "${NVCC}" -O3 -std=c++17 -arch="${ARCH}" --use_fast_math \
-            "${INCS[@]}" --ptxas-options=-v \
-            -c "${ROOT}/${f}" -o "${OUT}/${base}.o" 2> "${OUT}/${base}.log"; then
-        echo "  COMPILE FAILED:"
-        sed 's/^/    /' "${OUT}/${base}.log" | head -30
-        fail=1
-        continue
-    fi
-    # ptxas prints one "Function properties" block and one "Used N registers"
-    # line per instantiated kernel.
-    grep -E 'Function properties|Used [0-9]+ registers|spill|bytes smem|cmem' \
-        "${OUT}/${base}.log" | sed 's/^/  /' || echo "  (no ptxas report)"
+if [ "${1:-}" = "sweep" ]; then
+    echo "sweep over rows-per-warp:"
+    for r in 1 2 4; do report_one "${r}"; done
+else
+    ROWS="${BONSAI_GEMV_ROWS:-4}"
+    echo "default build (BONSAI_GEMV_ROWS=${ROWS}):"
+    report_one "${ROWS}"
     echo
-done
+    echo "  run './tools/regs.sh sweep' to see all three configurations"
+fi
 
 cat <<'EOF'
+
 WHAT TO LOOK FOR
 
-  gemv_pq2_0_p40_kernel  (declared __launch_bounds__(256, 4))
-    "Used N registers"  -> MUST be <= 64.  More than 64 is impossible under the
-                           launch bounds, so a higher number means the compiler
-                           spilled instead: look for "spill stores/loads" > 0.
-                           Spills in the four-row body are the prime suspect for
-                           the measured 1.92x slowdown (docs/MEASURED.md).
+  P40 register file: 65536 per SM, max 2048 threads (64 warps) per SM.
+  min_blocks=8 -> <= 32 regs -> 8 blocks/SM -> 64 warps/SM -> 100% occupancy
+  min_blocks=6 -> <= 42 regs -> 6 blocks/SM -> 48 warps/SM ->  75%
+  min_blocks=4 -> <= 64 regs -> 4 blocks/SM -> 32 warps/SM ->  50%
 
-  quant_q8_1_pq2_kernel  (declared __launch_bounds__(256, 8))
-    "Used N registers"  -> should be well under 32.
+  gemv_pq2_0_p40_kernel
+    rows=4 : needs ~64 regs.  Expect regs=64 and spill_stores=0.  That is the
+             configuration that was MEASURED at 11.39 tok/s vs the stock 21.90
+             (docs/MEASURED.md): the 1.92x regression matches the 64/32
+             occupancy ratio.  Forcing min_blocks=8 here SPILLS -> strictly worse.
+    rows=1 : needs far fewer regs.  Expect regs<=32 and spill_stores=0, i.e.
+             full occupancy -- the configuration worth measuring next.
 
-  If gemv_pq2_0_p40_kernel shows spills, the fix is to relax the launch bounds
-  (e.g. __launch_bounds__(256, 2) -> 128 registers) and re-run the A/B in
-  docs/WORKFLOW.md step 7.
+  Any non-zero "spill stores" is a red flag: spills live in local memory, which
+  is DRAM traffic, on a kernel that is already bandwidth-bound.
 EOF
-
-exit "${fail}"

@@ -59,18 +59,22 @@ constexpr int GEMV_WARPS_PER_BLOCK = 8;   // 256 threads
 #define BONSAI_GEMV_ROWS 4
 #endif
 
-constexpr int GEMV_ROWS_PER_WARP  = BONSAI_GEMV_ROWS;
-constexpr int GEMV_ROWS_PER_BLOCK = GEMV_WARPS_PER_BLOCK * GEMV_ROWS_PER_WARP;
-
-// Pick the min-blocks hint so the register budget matches what the row count
-// actually needs: 65536 regs/SM / (256 threads * blocks) = regs per thread.
-#if GEMV_ROWS_PER_WARP >= 4
+// NOTE: the branch test must use the MACRO, not the constexpr below.  The
+// preprocessor cannot see `constexpr int`, so `#if GEMV_ROWS_PER_WARP >= 4`
+// silently evaluates to `#if 0 >= 4` and every configuration ends up in the
+// #else branch (32-register cap, spills in the four-row body).  That mistake
+// shipped once; tools/regs.sh now prints the effective values so it cannot
+// happen silently again.
+#if BONSAI_GEMV_ROWS >= 4
 #define GEMV_MIN_BLOCKS 4     // <= 64 regs, 32 warps/SM
-#elif GEMV_ROWS_PER_WARP == 2
+#elif BONSAI_GEMV_ROWS == 2
 #define GEMV_MIN_BLOCKS 6     // <= 42 regs, 48 warps/SM
 #else
 #define GEMV_MIN_BLOCKS 8     // <= 32 regs, 64 warps/SM (full occupancy)
 #endif
+
+constexpr int GEMV_ROWS_PER_WARP  = BONSAI_GEMV_ROWS;
+constexpr int GEMV_ROWS_PER_BLOCK = GEMV_WARPS_PER_BLOCK * GEMV_ROWS_PER_WARP;
 
 __global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, GEMV_MIN_BLOCKS)
 gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,

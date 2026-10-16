@@ -93,7 +93,45 @@ Occupancy) gegen einen MLP-Gewinn, den es gar nicht gab — weil der Stock-Warp
 mit `blocks_per_iter = 4` bereits 136 zusammenhängende Bytes pro Iteration liest
 und die Bandbreite aus der Warp-Zahl zieht, nicht aus MLP pro Warp.
 
-## 4. Die eine Änderung, die daraus folgt
+## 4. Ein Bug in meinem eigenen Patch (gefunden durch `regs.sh`)
+
+Der erste `regs.sh`-Lauf auf einer P40 zeigte:
+
+```
+gemv_pq2_0_p40_kernel : 152 bytes stack frame, 184 bytes spill stores, 184 bytes spill loads
+                        Used 32 registers
+```
+
+Das war **nicht** die gemessene Konfiguration — es war ein Fehler, den ich mit
+dem `BONSAI_GEMV_ROWS`-Schalter eingebaut hatte:
+
+```cpp
+constexpr int GEMV_ROWS_PER_WARP = BONSAI_GEMV_ROWS;   // constexpr!
+...
+#if GEMV_ROWS_PER_WARP >= 4        // <-- Praeprozessor sieht KEIN constexpr
+```
+
+Der Präprozessor kann `constexpr int` nicht lesen; er sieht den Bezeichner als
+`0`, also wurde `#if 0 >= 4` falsch und **jede** Konfiguration landete im
+`#else`-Zweig → `GEMV_MIN_BLOCKS 8` → 32-Register-Cap → **Spills im
+Vier-Zeilen-Body**. Korrigiert auf `#if BONSAI_GEMV_ROWS >= 4` (das Makro).
+
+**Lehre für die Verifikation:** mein erster Test dieser Logik war wertlos, weil
+ich im Testkern `GEMV_ROWS_PER_WARP` selbst als Makro definiert hatte — ich
+habe meinen Test getestet, nicht den Code. Der Test extrahiert jetzt den Block
+**wörtlich** aus `src/kernels/gemv_p40.cu` und präprozessiert ihn:
+
+```
+  none                 -> MINBLOCKS=4 ROWS=4
+  -DBONSAI_GEMV_ROWS=1 -> MINBLOCKS=8 ROWS=1
+  -DBONSAI_GEMV_ROWS=2 -> MINBLOCKS=6 ROWS=2
+  -DBONSAI_GEMV_ROWS=4 -> MINBLOCKS=4 ROWS=4
+```
+
+Und `tools/regs.sh` prüft diese Zuordnung jetzt **bei jedem Lauf** gegen den
+echten Präprozessor und bricht ab, wenn Skript und Quelle auseinanderlaufen.
+
+## 5. Die Änderung, die daraus folgt
 
 Der Kernel ist jetzt auf den Zeilen-pro-Warp-Wert **baubar konfigurierbar**:
 
@@ -117,7 +155,7 @@ Ob es ihn *überholt*, ist offen — der einzige verbleibende Vorteil wäre dann
 noch, dass die PQ2_0-native Permutation pro Gewicht zwei `__byte_perm` spart,
 und die P40 ist dafür nicht instruktionsgebunden.
 
-## 5. Korrigierte Zahlen
+## 6. Korrigierte Zahlen
 
 `tools/gpu_predict.py` rechnet jetzt mit kalibrierten Effizienzen:
 
@@ -133,7 +171,7 @@ und die P40 ist dafür nicht instruktionsgebunden.
 Die **V100-Vorhersage war um 1.76× zu optimistisch**; `docs/V100_PREDICTION.md`
 ist entsprechend korrigiert.
 
-## 6. Was daraus folgt
+## 7. Was daraus folgt
 
 * **Der Stock-Pfad bleibt der Standard.** Der Fork hat für PQ2_0 auf Pascal
   keine kartenspezifische Optimierung (`MMVQ_PARAMETERS_GENERIC`), aber der
@@ -151,7 +189,7 @@ ist entsprechend korrigiert.
   Makro-Kollisionsprüfung und die Analyse in `docs/MMQ.md`/`docs/MTP.md`.
   Diese Teile sind durch die Messung nicht entwertet.
 
-## 7. Reproduktion
+## 8. Reproduktion
 
 ```bash
 M=models/Ternary-Bonsai-2-27B-PQ2_0.gguf
