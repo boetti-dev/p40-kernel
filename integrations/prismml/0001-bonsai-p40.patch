@@ -1,11 +1,11 @@
-From c21f15993c4dcc43f9ee82f89e65aeb764d1d5ec Mon Sep 17 00:00:00 2001
+From 4bb35f906039fcbcffd2c0dc275c57dbe6720f44 Mon Sep 17 00:00:00 2001
 From: cline <dev@local>
 Date: Fri, 16 Oct 2026 21:21:25 +0000
 Subject: [PATCH] cuda: opt-in sm_61 PQ2_0 decode path for the Tesla P40
  (bonsai-p40, OFF by default)
 
 ---
- ggml/src/ggml-cuda/CMakeLists.txt             |   4 +
+ ggml/src/ggml-cuda/CMakeLists.txt             |  14 ++
  ggml/src/ggml-cuda/bonsai-p40/README.md       |  90 ++++++++
  ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h    |  53 +++++
  .../bonsai-p40/bonsai_p40_dispatch.cu         | 112 +++++++++
@@ -16,7 +16,7 @@ Subject: [PATCH] cuda: opt-in sm_61 PQ2_0 decode path for the Tesla P40
  ggml/src/ggml-cuda/bonsai-p40/p40_ptx.h       |  71 ++++++
  ggml/src/ggml-cuda/bonsai-p40/pq2_0.h         | 193 ++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda.cu               |   5 +
- 11 files changed, 963 insertions(+)
+ 11 files changed, 973 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/README.md
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/bonsai_p40.h
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/bonsai_p40_dispatch.cu
@@ -28,7 +28,7 @@ Subject: [PATCH] cuda: opt-in sm_61 PQ2_0 decode path for the Tesla P40
  create mode 100644 ggml/src/ggml-cuda/bonsai-p40/pq2_0.h
 
 diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
-index b687cd5..83b934c 100644
+index b687cd5..ee88e16 100644
 --- a/ggml/src/ggml-cuda/CMakeLists.txt
 +++ b/ggml/src/ggml-cuda/CMakeLists.txt
 @@ -103,6 +103,10 @@ if (CUDAToolkit_FOUND)
@@ -42,6 +42,20 @@ index b687cd5..83b934c 100644
      file(GLOB   SRCS "template-instances/fattn-tile*.cu")
      list(APPEND GGML_SOURCES_CUDA ${SRCS})
      file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+@@ -270,3 +274,13 @@ if (CUDAToolkit_FOUND)
+ else()
+     message(FATAL_ERROR "CUDA Toolkit not found")
+ endif()
++
++# Bonsai-P40: output rows per warp for the sm_61 PQ2_0 decode kernel.
++# Register cost scales with the row count, and on a latency-bound bandwidth
++# kernel the resident warp count is what matters (see docs/MEASURED.md):
++#   1 -> 32 regs -> 64 warps/SM (full occupancy)
++#   2 -> 40 regs -> 48 warps/SM
++#   4 -> 64 regs -> 32 warps/SM (the configuration measured at 11.39 vs 21.90 tok/s)
++set(BONSAI_GEMV_ROWS "4" CACHE STRING "output rows per warp for the P40 PQ2_0 GEMV (1, 2 or 4)")
++target_compile_definitions(ggml-cuda PRIVATE
++    "$<$<COMPILE_LANGUAGE:CUDA>:BONSAI_GEMV_ROWS=${BONSAI_GEMV_ROWS}>")
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/README.md b/ggml/src/ggml-cuda/bonsai-p40/README.md
 new file mode 100644
 index 0000000..6d165f6

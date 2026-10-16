@@ -131,7 +131,49 @@ habe meinen Test getestet, nicht den Code. Der Test extrahiert jetzt den Block
 Und `tools/regs.sh` prüft diese Zuordnung jetzt **bei jedem Lauf** gegen den
 echten Präprozessor und bricht ab, wenn Skript und Quelle auseinanderlaufen.
 
-## 5. Die Änderung, die daraus folgt
+## 5. Der Sweep auf der P40 (aus `./tools/regs.sh sweep`)
+
+```
+config-block check (script expectation vs. real preprocessor):
+  OK: rows=1->8, rows=2->6, rows=4->4 min-blocks
+
+  rows=1  min_blocks=8  regs=32   spill_stores=0  stack=0  -> 64 warps/SM
+  rows=2  min_blocks=6  regs=40   spill_stores=0  stack=0  -> 48 warps/SM
+  rows=4  min_blocks=4  regs=64   spill_stores=0  stack=0  -> 32 warps/SM
+```
+
+Damit ist alles bestätigt, was zu prüfen war:
+
+* **Der Registerbedarf skaliert exakt mit der Zeilenzahl** (32 / 40 / 64) — die
+  vier Zeilen sind der Grund für die halbierte Occupancy.
+* **Keine Spills in irgendeiner Konfiguration.** Der Vier-Zeilen-Body passt in 64
+  Register; er ist nur teuer, nicht kaputt.
+* **`rows=1` passt in genau 32 Register ohne Spills → 64 Warps/SM → 100 %
+  Occupancy.** Das ist die einzige Konfiguration, die den Registerbedarf auf das
+  Niveau des Stock-Pfads bringt, und damit der Test, der die Frage entscheidet.
+
+### Der A/B-Test für `rows=1`
+
+```bash
+cd llama.cpp
+M=../p40-kernel/models/Ternary-Bonsai-2-27B-PQ2_0.gguf
+
+# rows=1 -> 32 Register, 64 Warps/SM.  Ueber die CMake-Option, kein sed noetig.
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=61 \
+      -DCMAKE_BUILD_TYPE=Release -DBONSAI_GEMV_ROWS=1
+cmake --build build --config Release -j"$(nproc)"
+
+BONSAI_P40=1 ./build/bin/llama-bench -m $M -ngl 99 -fa on -p 0 -n 128   # mein Kernel
+BONSAI_P40=0 ./build/bin/llama-bench -m $M -ngl 99 -fa on -p 0 -n 128   # Stock
+```
+
+Erwartung nach der Occupancy-Analyse: **`rows=1` schließt die Lücke**
+(≈ 21.9 tok/s). Ob es den Stock-*überholt*, bleibt offen: der einzige dann
+verbleibende Unterschied ist, dass die PQ2_0-native Permutation pro Gewicht zwei
+`__byte_perm` spart — und die P40 ist dafür nicht instruktionsgebunden. Ich
+rechne mit **Gleichstand, nicht mit Gewinn**.
+
+## 6. Die Änderung, die daraus folgt
 
 Der Kernel ist jetzt auf den Zeilen-pro-Warp-Wert **baubar konfigurierbar**:
 
@@ -155,7 +197,7 @@ Ob es ihn *überholt*, ist offen — der einzige verbleibende Vorteil wäre dann
 noch, dass die PQ2_0-native Permutation pro Gewicht zwei `__byte_perm` spart,
 und die P40 ist dafür nicht instruktionsgebunden.
 
-## 6. Korrigierte Zahlen
+## 7. Korrigierte Zahlen
 
 `tools/gpu_predict.py` rechnet jetzt mit kalibrierten Effizienzen:
 
@@ -171,7 +213,7 @@ und die P40 ist dafür nicht instruktionsgebunden.
 Die **V100-Vorhersage war um 1.76× zu optimistisch**; `docs/V100_PREDICTION.md`
 ist entsprechend korrigiert.
 
-## 7. Was daraus folgt
+## 8. Was daraus folgt
 
 * **Der Stock-Pfad bleibt der Standard.** Der Fork hat für PQ2_0 auf Pascal
   keine kartenspezifische Optimierung (`MMVQ_PARAMETERS_GENERIC`), aber der
@@ -189,7 +231,7 @@ ist entsprechend korrigiert.
   Makro-Kollisionsprüfung und die Analyse in `docs/MMQ.md`/`docs/MTP.md`.
   Diese Teile sind durch die Messung nicht entwertet.
 
-## 8. Reproduktion
+## 9. Reproduktion
 
 ```bash
 M=models/Ternary-Bonsai-2-27B-PQ2_0.gguf
