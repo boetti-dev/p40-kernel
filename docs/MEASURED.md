@@ -48,46 +48,76 @@ gibt **keine** universelle Effizienzzahl.
 Mit der gemessenen P40-Effizienz (45.5 %) sagt das korrigierte Modell
 **21.8 tok/s** voraus — gegen **21.90 gemessen**. Die Kalibrierung sitzt jetzt.
 
-## 3. Warum meine Optimierung scheiterte
+## 3. Ursache bestätigt: Occupancy, nicht MLP
 
-Meine Begründung war: *„4 Zeilen pro Warp ⇒ 4 unabhängige Gewichtsströme in
-Flight ⇒ mehr Memory-Level-Parallelität pro Warp ⇒ mehr Bandbreite."*
+`ptxas -v` auf `src/kernels/gemv_p40.cu` (`sm_61`, CUDA wie auf der P40):
 
-Die Prämisse war falsch. Der Stock-Warp deckt schon von sich aus einen
-zusammenhängenden Bereich ab:
-
-```c
-// ggml/src/ggml-cuda/mmvq.cu:784
-for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-//  qi/vdr = 8   -> 8 Threads pro 128er-Block
-//  blocks_per_iter = vdr * warp_size / qi = 1 * 32 / 8 = 4
+```
+quant_q8_1_pq2_kernel : Used 15 registers
+gemv_pq2_0_p40_kernel : Used 64 registers, used 0 barriers, 352 bytes cmem[0]
 ```
 
-Der Warp liest also **4 K-Blöcke pro Iteration = 136 zusammenhängende Bytes**,
-mit 8 Lanes pro Block. Der Speicher-Fußabdruck pro Iteration ist winzig; die
-Bandbreite kommt aus **vielen Warps**, nicht aus MLP pro Warp.
+Zwei harte Fakten daraus:
 
-Mein Kernel liest stattdessen 4 Zeilen × 32 Blöcke = **36 Cache-Lines pro
-Iteration**. Das erhöht nicht die Bandbreite, sondern die Last pro Warp über die
-Scoreboard-Kapazität hinaus: nach wenigen offenen Loads stallt der Warp, der
-Rest serialisiert. **MLP-pro-Warp war der falsche Hebel.**
+1. **64 Register = exakt das Cap** von `__launch_bounds__(256, 4)`
+   (`65536 / (4 × 256) = 64`). Der Allokator hat das Budget voll ausgeschöpft.
+2. **Keine Spills** — es fehlt die Zeile `N bytes stack frame, M bytes spill
+   stores, K bytes spill loads`. Die Registerzahl ist also echt, nicht durch
+   Spilling erkauft.
 
-### Hypothesen für die verbleibende 2×-Lücke
+Daraus folgt die Occupancy:
 
-Nicht bestätigt — dafür braucht es `-Xptxas -v` und ein Profil:
+| Register | Blöcke/SM | Warps/SM | Occupancy |
+|---|---|---|---|
+| **64** (mein GEMV) | **4** | **32** | **50 %** |
+| 15 (mein Quant-Kernel) | 8 | 64 | 100 % |
+| ~15–25 (Stock mmvq) | 8 | 64 | 100 % |
 
-1. **Occupancy.** `__launch_bounds__(256, 4)` ergibt 32 Warps/SM. Der
-   Stock-Kernel hat niedrige Registerlast und damit mehr Warps — und bei einem
-   latenzgebundenen Bandbreitenkernel schlagen mehr Warps mehr MLP-pro-Warp.
-2. **Der zusätzliche, serialisierte Quantisierungs-Launch.** Ich habe die
-   Aktivierungsquantisierung aus dem Mat-Vec herausgezogen (≈401 MUL_MATs pro
-   Token ⇒ 401 zusätzliche, abhängige Launches). Der Stock-Pfad quantisiert
-   gefused in Shared Memory.
-3. **`p40_prefetch_l2`** — 4 Prefetch-Instruktionen pro Block-Iteration, die
-   die Demand-Loads ohnehin abdecken. Reiner Issue-Overhead.
-4. **Registerdruck/Spills** aus dem Vier-Zeilen-Body unter dem 64-Register-Cap.
+Und jetzt die Gegenüberstellung, die die Sache entscheidet:
 
-## 4. Korrigierte Zahlen
+```
+Regressionsfaktor  21.90 / 11.39 = 1.923
+Occupancy-Faktor   64 / 32       = 2.000
+```
+
+**Die Regression ist die halbierte Occupancy.** Das ist keine Korrelation aus
+zwei Datenpunkten, sondern eine Erklärung, die zur Mechanik passt: bei einem
+latenzgebundenen Bandbreitenkernel auf einer Karte mit ~600 ns Speicherlatenz
+zählt die Zahl der residenten Warps, weil die Scoreboard-Kapazität pro Warp die
+offenen Loads begrenzt. Der Stock-Kernel hat einen winzigen Registerbedarf und
+läuft deshalb mit 64 Warps/SM; meiner verbraucht sein Budget für vier Zeilen
+und halbiert damit genau den Faktor, der zählt.
+
+**Meine Optimierung war also ein Tausch am falschen Ende:** Register (und damit
+Occupancy) gegen einen MLP-Gewinn, den es gar nicht gab — weil der Stock-Warp
+mit `blocks_per_iter = 4` bereits 136 zusammenhängende Bytes pro Iteration liest
+und die Bandbreite aus der Warp-Zahl zieht, nicht aus MLP pro Warp.
+
+## 4. Die eine Änderung, die daraus folgt
+
+Der Kernel ist jetzt auf den Zeilen-pro-Warp-Wert **baubar konfigurierbar**:
+
+```bash
+# in src/kernels/gemv_p40.cu bzw. ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
+-DBONSAI_GEMV_ROWS=1    # -> GEMV_MIN_BLOCKS 8, <= 32 Register, 64 Warps/SM
+-DBONSAI_GEMV_ROWS=2    # -> GEMV_MIN_BLOCKS 6, <= 42 Register, 48 Warps/SM
+-DBONSAI_GEMV_ROWS=4    # -> GEMV_MIN_BLOCKS 4, <= 64 Register, 32 Warps/SM (Default, gemessen)
+```
+
+`GEMV_MIN_BLOCKS` wird automatisch passend gesetzt. Der Test ist einzeilig:
+
+```bash
+./tools/regs.sh gemv                 # Registerzahl prüfen: <= 32 für rows=1?
+# dann in llama.cpp neu bauen und der A/B aus docs/WORKFLOW.md Schritt 7
+```
+
+Erwartung nach dieser Analyse: **`rows=1` sollte die Lücke schließen oder
+schlagen**, weil es den Registerbedarf auf das Niveau des Stock-Pfads bringt.
+Ob es ihn *überholt*, ist offen — der einzige verbleibende Vorteil wäre dann
+noch, dass die PQ2_0-native Permutation pro Gewicht zwei `__byte_perm` spart,
+und die P40 ist dafür nicht instruktionsgebunden.
+
+## 5. Korrigierte Zahlen
 
 `tools/gpu_predict.py` rechnet jetzt mit kalibrierten Effizienzen:
 
@@ -103,7 +133,7 @@ Nicht bestätigt — dafür braucht es `-Xptxas -v` und ein Profil:
 Die **V100-Vorhersage war um 1.76× zu optimistisch**; `docs/V100_PREDICTION.md`
 ist entsprechend korrigiert.
 
-## 5. Was daraus folgt
+## 6. Was daraus folgt
 
 * **Der Stock-Pfad bleibt der Standard.** Der Fork hat für PQ2_0 auf Pascal
   keine kartenspezifische Optimierung (`MMVQ_PARAMETERS_GENERIC`), aber der
@@ -121,7 +151,7 @@ ist entsprechend korrigiert.
   Makro-Kollisionsprüfung und die Analyse in `docs/MMQ.md`/`docs/MTP.md`.
   Diese Teile sind durch die Messung nicht entwertet.
 
-## 6. Reproduktion
+## 7. Reproduktion
 
 ```bash
 M=models/Ternary-Bonsai-2-27B-PQ2_0.gguf

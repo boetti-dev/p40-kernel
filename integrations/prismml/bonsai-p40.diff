@@ -316,10 +316,10 @@ index 0000000..bd043b1
 +                        struct ggml_tensor * dst, cudaStream_t stream);
 diff --git a/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu b/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
 new file mode 100644
-index 0000000..c54dd8a
+index 0000000..5ba670d
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/bonsai-p40/gemv_p40.cu
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,212 @@
 +// gemv_p40.cu -- decode (batch = 1) PQ2_0 mat-vec, the bandwidth-critical
 +// kernel of the whole engine.
 +//
@@ -361,13 +361,40 @@ index 0000000..c54dd8a
 +namespace {
 +
 +constexpr int GEMV_WARPS_PER_BLOCK = 8;   // 256 threads
-+constexpr int GEMV_ROWS_PER_WARP   = 4;   // weight streams + activation reuse
-+constexpr int GEMV_ROWS_PER_BLOCK  = GEMV_WARPS_PER_BLOCK * GEMV_ROWS_PER_WARP;
 +
-+// __launch_bounds__(256, 4): 32 warps/SM and 64 registers/thread, so the
-+// four-row body (4 pointers, 4 scales, 4 accumulators, 8 activation words,
-+// 8 code words) stays in registers without spilling.
-+__global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, 4)
++// Output rows per warp.  This is the knob that decides the trade the kernel
++// makes, and it is a BUILD option because the answer is hardware-specific:
++//
++//   more rows/warp  ->  more weight streams in flight, but more registers
++//                       -> fewer resident warps
++//
++// MEASURED on a Tesla P40 (docs/MEASURED.md): rows=4 needs exactly 64 registers
++// (the cap of __launch_bounds__(256,4)), which limits the kernel to 4 blocks/SM
++// = 32 warps/SM = 50% occupancy.  The stock mmvq uses ~15-25 registers and runs
++// at full occupancy, and it is 1.92x faster -- the same ratio as 64/32.  So on
++// this card occupancy beats per-warp MLP.
++//
++// Rebuild with -DBONSAI_GEMV_ROWS=1 (or 2) to test the other side:
++//   nvcc ... -DBONSAI_GEMV_ROWS=1 -Xptxas -v -c src/kernels/gemv_p40.cu
++//   then the A/B in docs/WORKFLOW.md step 7.
++#ifndef BONSAI_GEMV_ROWS
++#define BONSAI_GEMV_ROWS 4
++#endif
++
++constexpr int GEMV_ROWS_PER_WARP  = BONSAI_GEMV_ROWS;
++constexpr int GEMV_ROWS_PER_BLOCK = GEMV_WARPS_PER_BLOCK * GEMV_ROWS_PER_WARP;
++
++// Pick the min-blocks hint so the register budget matches what the row count
++// actually needs: 65536 regs/SM / (256 threads * blocks) = regs per thread.
++#if GEMV_ROWS_PER_WARP >= 4
++#define GEMV_MIN_BLOCKS 4     // <= 64 regs, 32 warps/SM
++#elif GEMV_ROWS_PER_WARP == 2
++#define GEMV_MIN_BLOCKS 6     // <= 42 regs, 48 warps/SM
++#else
++#define GEMV_MIN_BLOCKS 8     // <= 32 regs, 64 warps/SM (full occupancy)
++#endif
++
++__global__ void __launch_bounds__(GEMV_WARPS_PER_BLOCK * 32, GEMV_MIN_BLOCKS)
 +gemv_pq2_0_p40_kernel(const block_pq2_0 * __restrict__ W,
 +                      const block_q8_1  * __restrict__ X,
 +                      float * __restrict__ Y,
