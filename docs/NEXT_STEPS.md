@@ -156,38 +156,70 @@ Das Skript zieht die Schlussfolgerung selbst:
   fertig, **Weg 1 ist der einzige Hebel**.
 * **> 1.25×** → es gibt Kernel-Headroom → **Weg 3**.
 
-## Weg 2 — GEMESSEN: die Karte hat 1.60x Headroom. Repack ist der Hebel
+## Weg 2 — GEMESSEN: das Zugriffsmuster ist der Flaschenhals
 
-`./build/bwtest` auf einer echten P40:
+`./build/bwtest` auf einer echten P40 (das Kontrollkernel läuft mit 2 Registern
+bei voller Occupancy, liest **nur Gewichte**, keine Aktivierungen, keine
+Compute):
+
+| Test | GB/s | % der 346-GB/s-Peak |
+|---|---|---|
+| alignierter `uint4`-Stream | **251.8** | 72.8 % |
+| **PQ2_0-Adressierung, reiner Read** | **183.6** | **53.1 %** |
+| Stock-Decode (erreicht) | 157.5 | 45.5 % |
+
+Damit zerfällt die Lücke in **zwei getrennte, quantifizierte Verluste**:
 
 ```
-  read-only          :   251.8 GB/s   (aligned uint4)
-  read+write         :   243.5 GB/s
-  PQ2_0 addressing   :   (siehe Ausgabe)
-  stock mmvq decode  :   157.5 GB/s   (gemessen)
-  aligned stream / stock decode : 1.60x
+Pattern-Strafe   251.8 / 183.6 = 1.371x  (+37.1 %)   allein durch die Adressierung
+Stock vs Muster  183.6 / 157.5 = 1.166x  (+16.6 %)   der Stock holt 85.8 % seines Musters
+Gesamtpotenzial  251.8 / 157.5 = 1.599x
 ```
 
-**Die Karte ist NICHT die Grenze.** Sie liefert 251.8 GB/s auf einem reinen
-Stream; der Stock-Decode erreicht davon nur 62.5 %. Meine frühere Aussage
-„die Karte ist die Grenze, nur PTQ1_0 hilft“ war falsch — korrigiert in
-`docs/P40_OPTIMIZATION.md` Abschnitt 2b.
+Die 34-Byte-Blöcke (2-Byte-aligniert, 4-Byte-Worte) kosten **37 % Bandbreite,
+ohne jede Rechenarbeit**. Das ist kein Occupancy- und kein Issue-Effekt — es ist
+reine Adressierung.
 
-### Die Arbeitshypothese (pruefbar mit demselben Tool)
+### Was das für die erwartete Ausbeute heißt
 
-Der Unterschied zwischen 251.8 und 157.5 GB/s ist das **Zugriffsmuster**:
-34-Byte-Blöcke, nur 2-Byte-aligniert, 4-Byte-Worte pro Lane. Ein reiner
-Lesetest mit *genau dieser* Adressierung entscheidet:
+| Szenario | effektiv | PQ2_0 | PTQ1_0 |
+|---|---|---|---|
+| Stock heute | 157.5 GB/s | 21.9 tok/s | 26.5 tok/s |
+| nur Muster-Limit (ohne Repack) | 183.6 | 25.5 | 30.9 |
+| Repack, konservativ (85.8 % des neuen Limits) | 216.0 | **30.0** (1.37×) | **36.3** (1.66×) |
+| Repack, ideal | 251.8 | **35.0** (1.60×) | **42.3** (1.93×) |
 
-* landet er bei ~157 GB/s → das Muster ist der Flaschenhals, und ein
-  **Repack auf ein 16-Byte-aligniertes Layout** ist der Fix.
-* landet er bei ~250 GB/s → das Muster ist unschuldig, dann liegt es an
-  Occupancy/Aktivierungs-Traffic/Issue des Stock-Kernels.
+**Realistische Spanne: 27–33 tok/s mit PQ2_0, 32–37 tok/s mit PTQ1_0** — also
+**1.2×–1.7×** gegenüber heute. Die Spanne ist bewusst breit: die *Speicherseite*
+ist gemessen, ob ein Kernel das neue Limit auch erreicht, ist es nicht.
 
-Der Repack ist der einzige Hebel, den **nur ein eigener Loader** hat: der Fork
-muss die GGUF-Tensoren in place konsumieren, mein Engine liest die Datei selbst
-und kann die 7.21 GB (bzw. 5.95 GB mit PTQ1_0) einmal beim Laden umpacken.
-Kosten: eine Vollkopie beim Start. Nutzen: bis zu **1.6x** pro Token.
+### Der Repack — vier Entwurfs-Constraints, alle gemessen
+
+Das ist jetzt kein Raten mehr, sondern das Ergebnis der Messungen:
+
+1. **Gewichtsladungen müssen ≥ 8 Byte aligniert und über den Warp
+   zusammenhängend sein.** Die 37 % oben sind der Preis für 34-Byte-Blöcke mit
+   4-Byte-Worten. Also: `d` getrennt ablegen, Code-Bytes in ein aligniertes
+   Layout packen (z. B. SoA nach Chunk, damit ein Warp 256 zusammenhängende
+   Bytes pro Instruktion liest).
+2. **Aktivierungen müssen aus Shared Memory kommen.** Mein Kernel las sie pro
+   Zeile aus L2 — **4.24× das Gewichtsvolumen** (gemessen, `docs/MEASURED.md`).
+   Der Stock staged sie einmal pro Block.
+3. **Register ≤ 32 für volle Occupancy.** Gemessen: rows=4 (64 Register, 50 %
+   Occupancy) → 11.39 tok/s; rows=1 (32 Register, 100 %) → 17.34 tok/s. Faktor
+   1.52× allein daraus.
+4. **Quantisierung fusioniert.** Mein separater Launch kostete ~400 abhängige
+   Launches pro Token.
+
+Und der entscheidende Punkt: **ein Repack kann nur ein eigener Loader machen.**
+Der Fork muss die GGUF-Tensoren *in place* konsumieren; mein Engine liest die
+Datei selbst und kann die 7.21 GB (bzw. 5.95 GB mit PTQ1_0) **einmal beim Laden**
+in ein aligniertes Layout umpacken. Kosten: eine Vollkopie beim Start. Nutzen:
+bis zu 1.6× pro Token.
+
+Das ist genau die Position, die mein erster Ansatz hatte — und die ich mit der
+(durch `bwtest` widerlegten) Begründung „breitere Loads sparen nur
+Instruktionen" weggeworfen habe. Siehe `docs/P40_OPTIMIZATION.md` Abschnitt 2b.
 
 ## Weg 3 — ergänzend: eine Pascal-MMVQ-Tabelle
 
@@ -224,7 +256,7 @@ komplett für Pascal-Karten.
 
 ## Reihenfolge
 
-1. **`./build/bwtest`** — steht die PQ2_0-Adressierung bei ~157 GB/s, ist das
+1. **Repack auf 8/16-Byte-Alignment** (Weg 2) — gemessen: das Muster kostet 37 %, Potenzial 1.37x bis 1.60x. Der einzige Hebel mit dieser Größe.
    Muster bewiesen und Weg 2 wird konkret. (read-only ist bereits gemessen:
    251.8 GB/s = 1.60x.)
 2. **PTQ1_0 benchmarken** (Weg 1) — null Aufwand, ~10 % erwartet, und
