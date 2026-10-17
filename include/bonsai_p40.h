@@ -29,6 +29,13 @@ int bonsai_p40_quant_activations(const float * x, void * out, int64_t n, bonsai_
 int bonsai_p40_gemm(const void * W, const void * Xq, float * Y,
                     int64_t n_out, int64_t n_in, int64_t n_tok, bonsai_stream stream);
 
+// --- aligned repacked layout (docs/NEXT_STEPS.md, Weg 2) --------------------
+// W in the repacked layout is size-neutral: row stride = 34 * (n_in/128).
+// Requires n_in/128 to be a multiple of 8 (true for every row of this model).
+int bonsai_p40_repack(const void * src, void * dst, int64_t n_out, int64_t n_in, bonsai_stream stream);
+int bonsai_p40_gemv_repack(const void * W, const float * x, float * y,
+                           int64_t n_out, int64_t n_in, bonsai_stream stream);
+
 // --- fused elementwise / transform kernels ----------------------------------
 // Activation Hadamard rotation (block 1024) with an explicit +-1 sign vector.
 int bonsai_p40_fwht(float * x, const float * signs, int64_t n, bonsai_stream stream);

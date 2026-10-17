@@ -88,15 +88,44 @@ if assert_mapping; then echo "  OK: rows=1->8, rows=2->6, rows=4->4 min-blocks";
     echo "  FAILED -- the mapping in regs.sh and in gemv_p40.cu disagree" >&2; exit 1; fi
 echo
 
-if [ "${1:-}" = "sweep" ]; then
+# Register report for the repacked-layout kernel: it has its own row knob
+# (BONSAI_REPACK_ROWS) and its own min-blocks mapping in gemv_repack_p40.cu.
+report_repack_one() {
+    local rows="$1"
+    local f="${ROOT}/src/kernels/gemv_repack_p40.cu"
+    local log="${OUT}/rp_r${1}.log" obj="${OUT}/rp_r${1}.o"
+    if ! "${NVCC}" -O3 -std=c++17 -arch="${ARCH}" --use_fast_math \
+            "${INCS[@]}" --ptxas-options=-v -DBONSAI_REPACK_ROWS="${rows}" \
+            -c "${f}" -o "${obj}" 2> "${log}"; then
+        echo "  COMPILE FAILED (rows=${rows}):"
+        sed 's/^/    /' "${log}" | head -20
+        return 1
+    fi
+    local regs spill
+    regs=$(grep -A3 'Function properties for.*gemv_repack_p40_kernel' "${log}" \
+           | grep -oE 'Used [0-9]+ registers' | head -1 | grep -oE '[0-9]+' || echo '?')
+    spill=$(grep -A3 'Function properties for.*gemv_repack_p40_kernel' "${log}" \
+            | grep -oE '[0-9]+ bytes spill stores' | head -1 | grep -oE '^[0-9]+' || echo 0)
+    printf '  rows=%-2s regs=%-4s spill_stores=%-5s -> %s warps/SM%s\n' \
+        "${rows}" "${regs}" "${spill:-0}" "$(warps_for_rows "${rows}")" \
+        "$( [ "${spill:-0}" != 0 ] && echo '  <-- SPILLS' )"
+}
+
+if [ "${1:-}" = "repack" ]; then
+    echo "aligned repacked GEMV (gemv_repack_p40_kernel):"
+    for r in 1 2 4; do report_repack_one "${r}"; done
+    echo
+    echo "  activation:weight byte ratio is 4/R; the target is <=32 regs (64 warps/SM)."
+elif [ "${1:-}" = "sweep" ]; then
     echo "sweep over rows-per-warp:"
     for r in 1 2 4; do report_one "${r}"; done
 else
-    ROWS="${BONSAI_GEMV_ROWS:-4}"
+    ROWS="${BONSAI_GEMV_ROWS:-1}"
     echo "default build (BONSAI_GEMV_ROWS=${ROWS}):"
     report_one "${ROWS}"
     echo
-    echo "  run './tools/regs.sh sweep' to see all three configurations"
+    echo "  './tools/regs.sh sweep'  -> all three gemv rows configurations"
+    echo "  './tools/regs.sh repack' -> the aligned repacked kernel"
 fi
 
 cat <<'EOF'

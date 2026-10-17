@@ -30,6 +30,7 @@ zugeschnitten.
 | `src/kernels/elementwise_p40.cu` | Hadamard + RMSNorm |
 | `src/kernels/attn_p40.cu` | Gated DeltaNet + GQA-Flash-Attention |
 | `src/kernels/kv_p40.cu` | KV-Cache: Append/Quantisierung + Split-K-Decode-Attention |
+| `src/kernels/gemv_repack_p40.cu` | Decode-Mat-Vec über das **alignierte** Repack-Layout (siehe `docs/REPACK.md`) |
 | `tests/test_p40.cpp` | Host-Verifikation der gesamten Kernel-Mathematik |
 | `tools/check_gguf.py` | Prüft die Kernel-Konstanten gegen die echte GGUF-Datei |
 | `tools/disasm.sh` | PTX/SASS-Inspektion der Kernel (braucht `nvcc`) |

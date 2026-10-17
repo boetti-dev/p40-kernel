@@ -8,6 +8,7 @@
 #include "../src/p40_ptx.h"
 #include "../src/kv_cache.h"
 #include "../src/p40_dispatch_predicate.h"
+#include "../src/pq2_0_repack.h"
 #include "../src/fwht.h"
 #include "../src/ops.h"
 #include "../include/bonsai_model.h"
@@ -696,6 +697,190 @@ static void test_dispatch_predicate() {
     CHECK(P40_MAX_ROW >= 17408, "scratch covers feed_forward_length = 17408");
 }
 
+// ---------------------------------------------------------------------------
+// 12. Repacked layout: geometry, alignment, round trip, and the decisive check
+//     that the repacked dot is bit-identical to the original-layout reference.
+// ---------------------------------------------------------------------------
+static void test_repack() {
+    std::printf("[repack] aligned PQ2_0 layout\n");
+
+    // --- geometry: size-neutral and correctly aligned for every model width --
+    const int widths[] = {5120, 17408, 6144, 10240, 12288, 1024};
+    for (int w : widths) {
+        const int nb = w / 128;
+        CHECK(repack_requires(nb), "nblocks=%d satisfies nblocks%%8==0", nb);
+        CHECK(repack_row_stride(nb) == 34 * nb, "row stride %d is size-neutral (34*nblocks)", w);
+        CHECK(repack_codes_offset(nb) % 16 == 0, "codes offset is 16-byte aligned for n_in=%d", w);
+        CHECK(repack_d_offset(nb) % 16 == 0, "d offset is 16-byte aligned for n_in=%d", w);
+        CHECK(repack_n_units(nb) == 4 * nb, "4 units per block for n_in=%d", w);
+        // (plane, block) must be a bijection
+        std::vector<int> seen(4 * nb, 0);
+        for (int u = 0; u < repack_n_units(nb); ++u) {
+            const int idx = repack_plane_of_unit(u, nb) * nb + repack_block_of_unit(u, nb);
+            CHECK(idx >= 0 && idx < 4 * nb, "unit %d maps inside the block grid", u);
+            if (idx >= 0 && idx < 4 * nb) seen[idx]++;
+        }
+        bool bij = true;
+        for (int c : seen) if (c != 1) bij = false;
+        CHECK(bij, "unit -> (plane, block) is a bijection for n_in=%d", w);
+    }
+
+    // --- real round trip on a 5120-wide row ---------------------------------
+    std::mt19937 rng(31337);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    const int n_in = 5120, nb = n_in / 128;
+
+    std::vector<float> w(n_in), x(n_in);
+    for (auto & v : w) v = std::round(ud(rng) * 1.2f);
+    for (auto & v : x) v = ud(rng) * 3.0f;
+
+    std::vector<block_pq2_0> wq(nb);
+    quantize_row_pq2_0(w.data(), wq.data(), n_in);
+
+    // a 16-byte aligned destination, as cudaMalloc would give
+    const int stride = repack_row_stride(nb);
+    std::vector<uint8_t> raw((size_t)stride + 32);
+    uint8_t * row = raw.data() +
+        ((16 - ((uintptr_t)raw.data() % 16)) % 16);
+    CHECK((uintptr_t)row % 16 == 0, "repacked row base is 16-byte aligned");
+    repack_row_pq2_0(wq.data(), nb, row);
+
+    // every unit address must be 8-byte aligned (this is the whole point)
+    bool aligned = true;
+    for (int u = 0; u < repack_n_units(nb); ++u) {
+        const uintptr_t a = (uintptr_t)(row + repack_codes_offset(nb) + (size_t)u * 8);
+        if (a % 8 != 0) aligned = false;
+    }
+    CHECK(aligned, "all %d unit addresses are 8-byte aligned", repack_n_units(nb));
+
+    // round trip: unpack must reproduce the original blocks exactly
+    std::vector<block_pq2_0> back(nb);
+    unpack_row_pq2_0(row, nb, back.data());
+    bool same = true;
+    for (int b = 0; b < nb && same; ++b) {
+        if (back[b].d != wq[b].d) same = false;
+        for (int i = 0; i < 32; ++i) if (back[b].qs[i] != wq[b].qs[i]) same = false;
+    }
+    CHECK(same, "repack -> unpack reproduces the original blocks bit-exactly");
+
+    // --- THE decisive check: same integer dot through both layouts -----------
+    std::vector<block_q8_1> act(n_in / 32);
+    quantize_row_q8_1(x.data(), act.data(), n_in, /*permute=*/true);
+
+    const float ref = pq2_0_row_dot_perm(wq.data(), act.data(), n_in);
+    const float got = repack_row_dot(row, act.data(), nb);
+    check_close(got, ref, 1e-3f, "repacked dot == original-layout dot (bit-exact integer path)");
+
+    // and the unit-wise decomposition must sum to the same value
+    double sum_units = 0.0;
+    for (int u = 0; u < repack_n_units(nb); ++u)
+        sum_units += repack_unit_dot(row, act.data(), nb, u);
+    check_close((float)sum_units, ref, 1e-3f, "sum of unit dots == row dot");
+
+    // each unit must touch exactly one activation chunk, and all 4*nblocks
+    // chunks must be covered exactly once
+    std::vector<int> used(n_in / 32, 0);
+    for (int u = 0; u < repack_n_units(nb); ++u) used[repack_act_chunk(u, nb)]++;
+    bool all_once = true;
+    for (int c : used) if (c != 1) all_once = false;
+    CHECK(all_once, "every activation chunk is consumed exactly once");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Simulate the repacked kernel's loop structure: R rows per warp, lane-
+//     strided units, warp reduction, row clamping.  Mirrors
+//     gemv_repack_p40_kernel and must reproduce the reference row dots.
+// ---------------------------------------------------------------------------
+static void test_repack_kernel_loop() {
+    std::printf("[repack] R-rows-per-warp loop simulation\n");
+
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    const int n_in = 5120, nb = n_in / 128;
+    const int n_out = 5;                        // deliberately not a multiple of R
+    const int WARPS = 8;
+    const int stride = repack_row_stride(nb);
+
+    std::vector<float> w((size_t)n_out * n_in), x(n_in);
+    for (auto & v : w) v = std::round(ud(rng) * 1.2f);
+    for (auto & v : x) v = ud(rng) * 3.0f;
+
+    // repack every row into one buffer, 16-byte aligned like cudaMalloc
+    std::vector<block_pq2_0> wq((size_t)n_out * nb);
+    for (int r = 0; r < n_out; ++r)
+        quantize_row_pq2_0(w.data() + (size_t)r * n_in, wq.data() + (size_t)r * nb, n_in);
+
+    std::vector<uint8_t> raw((size_t)n_out * stride + 32);
+    uint8_t * W = raw.data() + ((16 - ((uintptr_t)raw.data() % 16)) % 16);
+    for (int r = 0; r < n_out; ++r)
+        repack_row_pq2_0(wq.data() + (size_t)r * nb, nb, W + (size_t)r * stride);
+
+    std::vector<block_q8_1> act(n_in / 32);
+    quantize_row_q8_1(x.data(), act.data(), n_in, /*permute=*/true);
+
+    const int nunits = repack_n_units(nb);
+    const int last = n_out - 1;
+
+    for (int R : {1, 2, 4}) {
+        const int rows_per_block = WARPS * R;
+        std::vector<float> out(n_out, -12345.0f);
+        int touched = 0;
+
+        for (int blk = 0; blk * rows_per_block < n_out + rows_per_block; ++blk) {
+            for (int warp = 0; warp < WARPS; ++warp) {
+                const int row0 = (blk * WARPS + warp) * R;
+                if (row0 >= n_out) continue;
+
+                // row pointers, clamped exactly like the kernel
+                std::vector<const uint8_t *> rp(R);
+                for (int r = 0; r < R; ++r)
+                    rp[r] = W + (size_t)std::min(row0 + r, last) * stride;
+
+                float lane_acc[32][4];      // [lane][row], R <= 4
+                for (int lane = 0; lane < 32; ++lane)
+                    for (int r = 0; r < R; ++r) lane_acc[lane][r] = 0.0f;
+
+                for (int lane = 0; lane < 32; ++lane) {
+                    for (int u = lane; u < nunits; u += 32) {
+                        const int c = repack_act_chunk(u, nb);
+                        const int b = repack_block_of_unit(u, nb);
+                        const float da = f16_to_f32(act[c].d);
+                        for (int r = 0; r < R; ++r) {
+                            const uint16_t dw = *(const uint16_t *)(rp[r] + 2 * b);
+                            lane_acc[lane][r] += f16_to_f32(dw) * da *
+                                 (float)repack_unit_sumi(rp[r], act.data(), nb, u);
+                        }
+                    }
+                }
+                // warp reduction, one accumulator per row (as the kernel does)
+                for (int o = 16; o > 0; o >>= 1)
+                    for (int r = 0; r < R; ++r)
+                        for (int l = 0; l < 32; ++l) {
+                            const int src = l + o;
+                            if (src < 32) lane_acc[l][r] += lane_acc[src][r];
+                        }
+                for (int r = 0; r < R; ++r) {
+                    if (row0 + r < n_out) { out[row0 + r] = lane_acc[0][r]; ++touched; }
+                }
+            }
+        }
+
+        for (int r = 0; r < n_out; ++r) {
+            const float ref = repack_row_dot(W + (size_t)r * stride, act.data(), nb);
+            check_close(out[r], ref, 1e-2f, "repack kernel row dot (R varies)");
+            CHECK(out[r] != -12345.0f, "R=%d stored row %d", R, r);
+        }
+        CHECK(touched == n_out, "R=%d: every row written exactly once (%d vs %d)",
+              R, touched, n_out);
+
+        int visits = 0;
+        for (int lane = 0; lane < 32; ++lane)
+            for (int u = lane; u < nunits; u += 32) ++visits;
+        CHECK(visits == nunits, "R=%d: lane striding covers each unit once (%d vs %d)",
+              R, visits, nunits);
+    }
+}
+
 int main() {
     test_pq2_0_format();
     test_fwht();
@@ -708,6 +893,8 @@ int main() {
     test_ptx_layer();
     test_kv_cache();
     test_dispatch_predicate();
+    test_repack();
+    test_repack_kernel_loop();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
