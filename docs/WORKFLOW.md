@@ -302,6 +302,7 @@ python3 tools/gpu_predict.py --bw 346 --sm 30 --fp32-per-sm 128 --name "mein P40
 | Symptom | Ursache / Lösung |
 |---|---|
 | `nvcc --list-gpu-arch` ohne `compute_61` | Toolkit zu neu (CUDA 13 hat Pascal entfernt) → CUDA 12.x installieren |
+| Ausgabe eines Tools passt nicht zum Quelltext / Zeile fehlt | **Stale Binary**: wenn der `nvcc`-Lauf fehlschlaegt, laeuft das alte Binary weiter und man sieht die alte Ausgabe. Immer erst `rm -f build/bwtest build/libbonsai_p40.a` und dann neu bauen — oder `./tools/build_p40.sh` benutzen, das mit `set -e` beim ersten Fehler abbricht. |
 | `Built target test_p40`, aber `./build/bin/llama-bench` fehlt | Du baust in **p40-kernel** statt in **llama.cpp**. `llama-bench` existiert nur im Fork; p40-kernel baut nur `test_p40` + `libbonsai_p40`. Also `cd llama.cpp` und dort konfigurieren/bauen. `-DGGML_CUDA=ON`/`-DBONSAI_GEMV_ROWS` werden in p40-kernel still ignoriert (nur eine Warnung über unbenutzte Variablen) — deshalb läuft cmake dort ohne Fehler durch. |
 | `cmake: command not found` | `sudo apt install cmake` |
 | `fatal error: bonsai_p40.h: Datei nicht gefunden` | Include-Pfad fehlt: `bonsai_p40.h` liegt in `include/`, also `-I src -I include` angeben (oder einfach `./tools/regs.sh` benutzen) |
