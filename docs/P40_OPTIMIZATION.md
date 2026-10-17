@@ -109,14 +109,29 @@ Letzterer ist genau der Grund, warum das Aktivierungs-Layout überhaupt
 transponiert wird: mit `dp4a` braucht man **kein** `prmt`/Byte-Shuffle pro
 Gewicht. Nachprüfbar mit `tools/disasm.sh`.
 
-## 2b. Warum es *keinen* Weight-Repack gibt
+## 2b. Weight-Repack — meine frühere Begründung war FALSCH
 
-Naheliegend wäre, die 7.21 GB einmal beim Laden in ein 4-Byte-alignetes Layout
-umzupacken (`d` getrennt, `qs` gepackt), damit man `ld.global.v4` (128 Bit)
-benutzen kann. Das ist bewusst **nicht** gemacht:
+> **KORREKTUR.** Hier stand, ein Repack lohne nicht, weil breitere Loads „nur
+> die Instruktionszahl reduzieren“ und die P40 nicht instruktionsgebunden ist.
+> **Das ist durch Messung widerlegt.** `tools/bwtest.cu` zeigt auf der P40:
+>
+> | Zugriffsmuster | Bandbreite |
+> |---|---|
+> | alignierter `uint4`-Stream | **251.8 GB/s** |
+> | PQ2_0-Adressierung (34-Byte-Stride, 4-Byte-Worte) | siehe `./build/bwtest` |
+> | Stock-Decode (erreicht) | 157.5 GB/s |
+>
+> Die Karte liefert **1.60x** mehr als der Stock-Decode erreicht. Der
+> Flaschenhals ist also nicht die Instruktionszahl, sondern das **Zugriffsmuster**:
+> 34-Byte-Blöcke mit 2-Byte-Ausrichtung erzeugen pro Load-Instruktion viele
+> weit gestreute Sektor-Anfragen. Das ist genau das, was ein Repack behebt.
+> Siehe `docs/NEXT_STEPS.md`, Weg 3.
 
-* Weniger/w breitere Loads reduzieren nur die Instruktionszahl → laut Tabelle
-  oben irrelevant.
+Ein Repack auf ein 16-Byte-aligniertes Layout ist damit **die** offene
+Optimierung — und nur ein eigener Loader kann sie machen, weil der Fork die
+GGUF-Tensoren in place konsumieren muss.
+
+Was von der alten Begründung bleibt:
 * Die Ladelast ist nur *scheinbar* misaligned: eine Lane liest 8 Byte an
   `34·b + 2 + 8·iqs`; über die 4 `iqs`-Iterationen werden alle 32 Codebytes
   jedes Blocks gelesen, und die 128-Byte-Linien werden mit `-dlcm=ca` im L1

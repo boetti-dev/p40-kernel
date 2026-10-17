@@ -19,6 +19,7 @@
 //   ./build/bwtest 4096       # 4 GiB buffer (keep below free VRAM)
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
 
 #define CUDA_CHECK(x)                                                          \
@@ -49,6 +50,40 @@ __global__ void __launch_bounds__(256) copy_kernel(const uint4 * __restrict__ sr
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     for (; i < n4; i += stride) dst[i] = src[i];
+}
+
+// ---------------------------------------------------------------------------
+// The decisive control experiment: read the SAME volume, but with the actual
+// PQ2_0 addressing instead of aligned uint4.
+//
+// PQ2_0 blocks are 34 bytes (2-byte fp16 scale + 32 code bytes) and are only
+// 2-byte aligned, so the decode kernel cannot use 128-bit loads.  The stock
+// mmvq covers 4 blocks per warp iteration (8 lanes per block, 4 bytes each),
+// i.e. a 136-byte span per warp instruction.
+//
+// If this kernel also lands near the 157 GB/s of the stock decode while the
+// aligned stream reaches 251 GB/s, then the ACCESS PATTERN is the bottleneck --
+// and a repacked, 16-byte-aligned weight layout is the fix.  If this kernel
+// reaches ~250 GB/s, the pattern is fine and the bottleneck is elsewhere
+// (occupancy, activation traffic, instruction issue).
+__global__ void __launch_bounds__(256) read_pq2_0_pattern_kernel(
+        const uint8_t * __restrict__ base, long nblocks, unsigned * __restrict__ sink) {
+    const int lane = threadIdx.x & 31;
+    const int blk_in_iter = lane >> 3;   // 4 blocks per warp iteration
+    const int sub          = lane & 7;   // 8 lanes per block, 4 bytes each
+    const long nwarps = ((long)gridDim.x * blockDim.x) >> 5;
+    const long warp   = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+
+    unsigned acc = 0;
+    for (long b0 = warp * 4; b0 < nblocks; b0 += nwarps * 4) {
+        // exactly the PQ2_0 address: block stride 34, qs starts at +2,
+        // 4-byte word inside the 32 code bytes
+        const uint8_t * p = base + (b0 + blk_in_iter) * 34 + 2 + sub * 4;
+        uint32_t v;
+        std::memcpy(&v, p, 4);
+        acc ^= v;
+    }
+    if (acc == 0xDEADBEEFu) sink[0] = 1;
 }
 
 static double run_read(const uint4 * buf, size_t bytes, int blocks) {
@@ -106,8 +141,27 @@ int main(int argc, char ** argv) {
     const double rd = run_read(a, bytes, blocks);
     const double cp = run_copy(a, b, bytes, blocks);
 
-    std::printf("  read-only  : %7.1f GB/s\n", rd);
-    std::printf("  read+write : %7.1f GB/s\n\n", cp);
+    // --- the control: the same volume, but with PQ2_0 addressing -----------
+    const long nblocks = (long)(bytes / 34);
+    unsigned * sink = nullptr;
+    cudaMalloc(&sink, sizeof(unsigned));
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    read_pq2_0_pattern_kernel<<<blocks, 256>>>((const uint8_t *)a, nblocks, sink);
+    cudaDeviceSynchronize();
+    cudaEventRecord(e0);
+    for (int r = 0; r < 5; ++r)
+        read_pq2_0_pattern_kernel<<<blocks, 256>>>((const uint8_t *)a, nblocks, sink);
+    cudaEventRecord(e1);
+    cudaEventSynchronize(e1);
+    float pms = 0; cudaEventElapsedTime(&pms, e0, e1);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(sink);
+    // useful bytes: 32 code bytes per 34-byte block, 4 of 4 blocks per warp
+    const double pat = (double)nblocks * 32 * 5 / (pms / 1e3) / 1e9;
+
+    std::printf("  read-only          : %7.1f GB/s   (aligned uint4)\n", rd);
+    std::printf("  read+write         : %7.1f GB/s\n", cp);
+    std::printf("  PQ2_0 addressing   : %7.1f GB/s   (34-byte stride, 4-byte words)\n\n", pat);
 
     // Reference points measured on a real P40 for PQ2_0 decode (docs/MEASURED.md)
     const double p40_stock = 157.5, p40_rows1 = 124.7, p40_rows4 = 81.9;
@@ -116,18 +170,23 @@ int main(int argc, char ** argv) {
     std::printf("    this kernel r1  %7.1f GB/s\n", p40_rows1);
     std::printf("    this kernel r4  %7.1f GB/s\n\n", p40_rows4);
 
-    if (rd > 0) {
-        std::printf("  read-only is %.2fx the stock decode rate\n", rd / p40_stock);
-        if (rd / p40_stock < 1.25) {
-            std::printf("  => the CARD is the limit.  The stock kernel is done; the only\n"
-                        "     lever left is moving fewer bytes: PTQ1_0 (-17%%).\n"
-                        "     See docs/NEXT_STEPS.md\n");
-        } else {
-            std::printf("  => the card has headroom the stock kernel does not reach.\n"
-                        "     Profiling the stock mmvq is worth it: the fork has no\n"
-                        "     Pascal MMVQ parameter table (MMVQ_PARAMETERS_GENERIC).\n"
-                        "     See docs/NEXT_STEPS.md\n");
-        }
+    std::printf("  aligned stream / stock decode : %.2fx\n", rd / p40_stock);
+    std::printf("  PQ2_0 pattern / stock decode  : %.2fx\n", pat / p40_stock);
+    std::printf("\n");
+
+    if (rd / p40_stock < 1.25) {
+        std::printf("  => the CARD is the limit.  The stock kernel is done; the only\n"
+                    "     lever left is moving fewer bytes: PTQ1_0 (-17%%).\n");
+    } else if (pat / p40_stock < 1.25) {
+        std::printf("  => the ACCESS PATTERN is the limit, not the card and not the\n"
+                    "     stock kernel: the same volume reads %.0f%% faster when aligned.\n",
+                    100.0 * (rd / pat - 1.0));
+        std::printf("     => a repacked, 16-byte-aligned weight layout is the fix.\n"
+                    "        See docs/NEXT_STEPS.md (Weg 3).\n");
+    } else {
+        std::printf("  => neither the card nor the pattern is the limit.  The stock\n"
+                    "     kernel leaves headroom for other reasons (occupancy,\n"
+                    "     activation traffic, issue) -- profile it.\n");
     }
 
     cudaFree(a); cudaFree(b);
