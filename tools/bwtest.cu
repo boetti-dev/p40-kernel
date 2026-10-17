@@ -19,7 +19,8 @@
 //   ./build/bwtest 4096       # 4 GiB buffer (keep below free VRAM)
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <cstddef>
+#include <cstdint>
 #include <cuda_runtime.h>
 
 #define CUDA_CHECK(x)                                                          \
@@ -75,12 +76,14 @@ __global__ void __launch_bounds__(256) read_pq2_0_pattern_kernel(
     const long warp   = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
 
     unsigned acc = 0;
-    for (long b0 = warp * 4; b0 < nblocks; b0 += nwarps * 4) {
-        // exactly the PQ2_0 address: block stride 34, qs starts at +2,
-        // 4-byte word inside the 32 code bytes
+    // b0 + 3 must stay in range: the buffer holds exactly nblocks * 34 bytes.
+    for (long b0 = warp * 4; b0 + 4 <= nblocks; b0 += nwarps * 4) {
+        // exactly the PQ2_0 address: block stride 34, qs starts at +2.
+        // Read as two uint16 (2-byte aligned -- valid), never as one uint32
+        // (only 2-byte aligned, which is the very thing being tested).
         const uint8_t * p = base + (b0 + blk_in_iter) * 34 + 2 + sub * 4;
-        uint32_t v;
-        std::memcpy(&v, p, 4);
+        const uint16_t * q = (const uint16_t *)p;
+        const uint32_t v = (uint32_t)q[0] | ((uint32_t)q[1] << 16);
         acc ^= v;
     }
     if (acc == 0xDEADBEEFu) sink[0] = 1;
