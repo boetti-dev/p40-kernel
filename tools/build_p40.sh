@@ -16,6 +16,10 @@ ARCH="-gencode arch=compute_61,code=sm_61"
 NVCC="${NVCC:-nvcc}"
 CXX="${CXX:-g++}"
 
+# --- 0. static checks (catch the bug classes that need no compiler) --------
+echo "== static checks =="
+python3 "${ROOT}/tools/check_sources.py"
+
 # --- 1. host test suite (always runs, needs no GPU) -------------------------
 echo "== host verification =="
 "${CXX}" -O2 -std=c++17 -I "${ROOT}/src" -I "${ROOT}/include" \

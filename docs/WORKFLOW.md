@@ -78,6 +78,12 @@ git log --oneline -1
 Das läuft überall und prüft die Numerik, die die P40 später ausführt.
 
 ```bash
+# 0. Statische Checks (kein Compiler nötig): Makro-Kollisionen, zerschnittene
+#    Funktionen, Klammerbilanz. Fängt genau die drei Fehlerklassen ab, die hier
+#    schon aufgetreten sind.
+python3 tools/check_sources.py
+
+# 1. Host-Suite
 g++ -O2 -std=c++17 -Wall -Wextra -I src -I include tests/test_p40.cpp -o test_p40
 ./test_p40
 ```

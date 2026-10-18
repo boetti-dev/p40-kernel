@@ -59,7 +59,7 @@ __device__ inline void quantise_act_to_smem(const float * __restrict__ x, block_
     const int ngroup = nthreads / 8;              // chunks per pass
     for (int c = threadIdx.x / 8; c < nchunk; c += ngroup) {
         const int s = threadIdx.x & 7;            // lane inside the 8-lane group
-        const float * xc = x + (size_t)c * QK8_1 + s * 4;
+        const float * xc = x + (size_t)c * BONSAI_QK8_1 + s * 4;
         float v[4];
         float amax = 0.0f;
 #pragma unroll
@@ -80,6 +80,13 @@ __device__ inline void quantise_act_to_smem(const float * __restrict__ x, block_
         for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, 8);
         if (s == 0) { act[c].d = f32_to_f16(d); act[c].s = (uint16_t)(int16_t)sum; }
 #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int j = s * 4 + i;                            // element index
+            const int p = 16 * (j >> 4) + 4 * (j & 3) + ((j >> 2) & 3);
+            act[c].qs[p] = q[i];
+        }
+    }
+}
 
 __global__ void __launch_bounds__(RP_WARPS * 32, RP_MIN_BLOCKS)
 gemv_repack_p40_kernel(const uint8_t * __restrict__ W, const float * __restrict__ x,
@@ -210,12 +217,4 @@ int bonsai_p40_gemv_repack(const void * W, const float * x, float * y,
     gemv_repack_p40_kernel<<<blocks, RP_WARPS * 32, smem, (cudaStream_t)stream>>>(
         (const uint8_t *)W, x, y, (int)n_out, nblocks);
     return (int)cudaGetLastError();
-}
-
-        for (int i = 0; i < 4; ++i) {
-            const int j = s * 4 + i;                            // element index
-            const int p = 16 * (j >> 4) + 4 * (j & 3) + ((j >> 2) & 3);
-            act[c].qs[p] = q[i];
-        }
-    }
 }
